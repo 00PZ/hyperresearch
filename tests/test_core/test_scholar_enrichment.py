@@ -416,3 +416,121 @@ class TestOaResolversStaySoft:
         monkeypatch.setattr(scholar, "_http_get_json", fake_get)
         assert oa._resolve_europepmc(tmp_vault.db, "10.1/x", 30, False) is None
         assert list(oa._unpaywall_candidates(tmp_vault.db, "10.1/x", 30, "a@b.c", True, False)) == []
+
+
+class TestSemanticScholarKeyScopeHardening:
+    """Security review of #70: the key must ride only on a real
+    semanticscholar.org host, per hop, and never follow a redirect away."""
+
+    LOOKALIKES = (
+        "https://evilsemanticscholar.org/steal",
+        "https://notsemanticscholar.org/steal",
+        "https://semanticscholar.org.evil.example/steal",
+        "https://api.semanticscholar.org@evil.example/steal",  # userinfo trick
+        "https://evil.example/?next=api.semanticscholar.org",
+        "https://evil.example/api.semanticscholar.org/graph",
+        "https://evil.example#semanticscholar.org",
+    )
+    GENUINE = (
+        "https://api.semanticscholar.org/graph/v1/paper/x",
+        "https://semanticscholar.org/x",
+        "https://API.SemanticScholar.ORG:443/x",  # case + explicit port
+        "https://user@api.semanticscholar.org/x",  # userinfo on the real host
+        "https://partner.api.semanticscholar.org./x",  # trailing-dot FQDN
+    )
+
+    def test_lookalike_hosts_never_get_the_key(self, monkeypatch, no_sleep):
+        monkeypatch.setenv("S2_API_KEY", "sekrit")
+        calls = _stub_httpx(monkeypatch, [])
+        for url in self.LOOKALIKES:
+            scholar._http_get_json(url)
+        assert len(calls) == len(self.LOOKALIKES)
+        for url, headers in calls:
+            assert "x-api-key" not in headers, url
+            assert "sekrit" not in url
+
+    def test_genuine_hosts_get_the_key(self, monkeypatch, no_sleep):
+        monkeypatch.setenv("S2_API_KEY", "sekrit")
+        calls = _stub_httpx(monkeypatch, [])
+        for url in self.GENUINE:
+            scholar._http_get_json(url)
+        for url, headers in calls:
+            assert headers.get("x-api-key") == "sekrit", url
+
+    def test_is_s2_host_survives_unparseable_urls(self):
+        assert scholar._is_s2_host("https://[::1/x") is False
+        assert scholar._is_s2_host("not a url") is False
+        assert scholar._is_s2_host("") is False
+
+    def test_key_is_dropped_on_cross_host_redirect(self, monkeypatch, no_sleep):
+        # httpx strips only `Authorization` on cross-origin redirects; a
+        # redirect off semanticscholar.org must not carry x-api-key along.
+        monkeypatch.setenv("S2_API_KEY", "sekrit")
+        calls = _stub_httpx(monkeypatch, [
+            _Resp(302, headers={"Location": "https://evil.example/collect"}),
+            _Resp(200, {"ok": 1}),
+        ])
+        assert scholar._http_get_json(S2_URL) == {"ok": 1}
+        assert [u for u, _ in calls] == [S2_URL, "https://evil.example/collect"]
+        assert calls[0][1]["x-api-key"] == "sekrit"
+        assert "x-api-key" not in calls[1][1]
+
+    def test_key_reattached_when_redirect_lands_back_on_s2(self, monkeypatch, no_sleep):
+        monkeypatch.setenv("S2_API_KEY", "sekrit")
+        calls = _stub_httpx(monkeypatch, [
+            _Resp(301, headers={"Location": "https://evil.example/hop"}),
+            _Resp(302, headers={"Location": "/graph/v1/paper/y"}),  # relative
+            _Resp(200, {"ok": 2}),
+        ])
+        assert scholar._http_get_json(S2_URL) == {"ok": 2}
+        assert [u for u, _ in calls] == [
+            S2_URL, "https://evil.example/hop", "https://evil.example/graph/v1/paper/y",
+        ]
+        assert "x-api-key" not in calls[1][1]
+        assert "x-api-key" not in calls[2][1]
+
+        calls = _stub_httpx(monkeypatch, [
+            _Resp(302, headers={"Location": "https://api.semanticscholar.org/v2"}),
+            _Resp(200, {"ok": 3}),
+        ])
+        assert scholar._http_get_json(S2_URL) == {"ok": 3}
+        assert calls[1][1]["x-api-key"] == "sekrit"
+
+    def test_redirect_chain_is_bounded(self, monkeypatch, no_sleep):
+        calls = _stub_httpx(monkeypatch, [
+            _Resp(302, headers={"Location": f"https://api.semanticscholar.org/loop/{i}"})
+            for i in range(50)
+        ])
+        assert scholar._http_get_json(S2_URL) is None
+        assert len(calls) == scholar._MAX_REDIRECTS + 1
+
+    def test_redirect_to_non_http_scheme_is_not_followed(self, monkeypatch, no_sleep):
+        calls = _stub_httpx(monkeypatch, [
+            _Resp(302, headers={"Location": "file:///etc/passwd"}),
+        ])
+        assert scholar._http_get_json(S2_URL) is None
+        assert len(calls) == 1
+
+    def test_redirect_without_location_is_soft_none(self, monkeypatch, no_sleep):
+        calls = _stub_httpx(monkeypatch, [_Resp(304)])
+        assert scholar._http_get_json(S2_URL) is None
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize("raw", ["-5", "nan", "inf", "1e12", "9" * 40, "", "  "])
+    def test_hostile_retry_after_never_sleeps_beyond_the_ladder(self, monkeypatch, no_sleep, raw):
+        _stub_httpx(monkeypatch, [
+            _Resp(429, headers={"Retry-After": raw}),
+            _Resp(429, headers={"Retry-After": raw}),
+            _Resp(200, {"a": 1}),
+        ])
+        scholar._http_get_json(S2_URL)
+        assert no_sleep == [2.0, 4.0]
+        assert sum(no_sleep) <= 2 * scholar._RETRY_AFTER_MAX
+
+    def test_rate_limited_error_never_carries_the_key(self, monkeypatch, no_sleep):
+        monkeypatch.setenv("S2_API_KEY", "sekrit")
+        _stub_httpx(monkeypatch, [_Resp(429)] * 3)
+        with pytest.raises(scholar.RateLimitedError) as exc:
+            scholar._http_get_json(S2_URL)
+        assert "sekrit" not in str(exc.value)
+        assert "sekrit" not in repr(exc.value)

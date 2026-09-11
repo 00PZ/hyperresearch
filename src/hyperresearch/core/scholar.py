@@ -35,7 +35,7 @@ import os
 import re
 import time
 from datetime import UTC, datetime, timedelta
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 DOI_RE = re.compile(r"\b(10\.\d{4,9}/[^\s\"'<>\])}]+)", re.IGNORECASE)
 ARXIV_URL_RE = re.compile(r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5}(?:v\d+)?)", re.IGNORECASE)
@@ -118,6 +118,13 @@ _RATE_LIMIT_BACKOFF = (2.0, 4.0)
 _RETRY_AFTER_MAX = 60.0
 
 _S2_KEY_ENV = ("S2_API_KEY", "SEMANTIC_SCHOLAR_API_KEY")
+_S2_KEY_HOST = "semanticscholar.org"
+
+# Redirects are followed by hand (not httpx's follow_redirects) so the
+# per-hop headers are recomputed from the hop's URL: httpx strips only
+# `Authorization` on a cross-origin redirect and would carry `x-api-key`
+# to whatever host semanticscholar.org pointed at.
+_MAX_REDIRECTS = 5
 
 
 def _s2_api_key() -> str | None:
@@ -128,16 +135,48 @@ def _s2_api_key() -> str | None:
     return None
 
 
+def _is_s2_host(url: str) -> bool:
+    """True only for semanticscholar.org itself or a subdomain of it.
+
+    Uses the parsed hostname (userinfo and port stripped) and a proper
+    suffix match, so `evilsemanticscholar.org`, `semanticscholar.org.evil`,
+    `evil@semanticscholar.org`-shaped userinfo tricks and a path that
+    merely contains the string all fail.
+    """
+    try:
+        host = urlparse(url).hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    host = host.lower().rstrip(".")
+    return host == _S2_KEY_HOST or host.endswith("." + _S2_KEY_HOST)
+
+
 def _request_headers(url: str) -> dict[str, str]:
     """Headers for one request. The Semantic Scholar key is scoped to its
     host and nowhere else — this function is the only place it is read."""
     headers = {"User-Agent": "hyperresearch (mailto:research@example.com)"}
-    host = urlparse(url).netloc.lower()
-    if host.endswith("semanticscholar.org"):
+    if _is_s2_host(url):
         key = _s2_api_key()
         if key:
             headers["x-api-key"] = key
     return headers
+
+
+def _redirect_target(resp, url: str) -> str | None:
+    """The absolute URL a 3xx response points at, or None if it is not a
+    followable redirect (no Location, or a non-http(s) scheme)."""
+    if not (300 <= resp.status_code < 400):
+        return None
+    headers = getattr(resp, "headers", None) or {}
+    location = headers.get("Location") or headers.get("location")
+    if not location:
+        return None
+    target = urljoin(url, str(location))
+    if urlparse(target).scheme not in ("http", "https"):
+        return None
+    return target
 
 
 def _retry_after_seconds(resp, attempt: int) -> float:
@@ -165,25 +204,36 @@ def _http_get_json(url: str) -> dict | None:
     """
     import httpx
 
-    headers = _request_headers(url)
     host = urlparse(url).netloc.lower()
-    for attempt in range(_RATE_LIMIT_ATTEMPTS):
+    attempt = 0
+    hops = 0
+    while True:
+        # Headers are recomputed per hop so the Semantic Scholar key only
+        # ever travels to a Semantic Scholar host (see _MAX_REDIRECTS).
+        headers = _request_headers(url)
         try:
-            resp = httpx.get(url, follow_redirects=True, timeout=20, headers=headers)
+            resp = httpx.get(url, follow_redirects=False, timeout=20, headers=headers)
         except Exception:
             return None
         if resp.status_code == 429:
-            if attempt + 1 < _RATE_LIMIT_ATTEMPTS:
-                time.sleep(_retry_after_seconds(resp, attempt))
+            attempt += 1
+            if attempt < _RATE_LIMIT_ATTEMPTS:
+                time.sleep(_retry_after_seconds(resp, attempt - 1))
                 continue
             raise RateLimitedError(host, _RATE_LIMIT_ATTEMPTS)
+        target = _redirect_target(resp, url)
+        if target is not None:
+            hops += 1
+            if hops > _MAX_REDIRECTS:
+                return None
+            url = target
+            continue
         if resp.status_code != 200:
             return None
         try:
             return resp.json()
         except Exception:
             return None
-    return None  # pragma: no cover - loop always returns or raises
 
 
 def _fetch_json(conn, url: str, ttl_days: int, fresh: bool = False) -> dict | None:

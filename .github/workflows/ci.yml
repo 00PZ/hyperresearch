@@ -8,6 +8,11 @@ on:
 
 jobs:
   test:
+    # Branch protection requires checks named exactly `test (3.11)` etc.
+    # Without an explicit name the os dimension would rename them to
+    # `test (ubuntu-latest, 3.11)` and every PR would wait on a status
+    # that never reports. Ubuntu keeps the bare name; Windows is suffixed.
+    name: test (${{ matrix.python-version }}${{ matrix.os == 'windows-latest' && ', windows' || '' }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

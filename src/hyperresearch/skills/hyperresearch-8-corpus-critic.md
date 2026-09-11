@@ -87,7 +87,7 @@ The targeted fetch wave in the next step will pull these filings BEFORE the corp
 
 2. **Merge into the step artifact.** Read the subagent's output (`research/runs/<vault_tag>/temp/corpus-critic-gaps-raw.json`; each gap carries an `id` like `cc-1`, a `priority` of critical / high, and a `type` of overturning / strengthening / independent-verification). Write `research/runs/<vault_tag>/corpus-critic-gaps.json` as `{"gaps": [...]}` containing the pre-flight `period-pinned-gaps.json` entries FIRST (they are the critical, period-pinned ones), then the subagent's gaps. Every gap keeps its `id` — the `pp-` / `cc-` prefixes keep the two sets from colliding, and the fetch wave below references gaps by id. If there was no pre-flight file, the merged file is just the subagent's gaps.
 
-3. **Targeted fetch wave.** Spawn **2–4 fetcher subagents** to search for and fetch the sources identified in the gaps.
+3. **Targeted fetch wave.** Spawn **<< p.corpus_critic_fetchers|dash >> fetcher subagents** to search for and fetch the sources identified in the gaps.
 
    **Spawn template:**
    ```

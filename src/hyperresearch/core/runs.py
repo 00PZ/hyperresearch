@@ -499,7 +499,7 @@ def verify_run(vault, vault_tag: str) -> dict:
             for g in _re.findall(r"\[(\d{1,3}(?:\s*,\s*\d{1,3})*)\]", report_text)
         ) + len(_re.findall(r"\[\[[^\]]+\]\]", report_text))
         density = cites / max(1, len(report_text)) * 1000
-        floor = 1.5  # instruction-critic's re-count trigger
+        floor = profile.citation_density_min  # also the instruction critic's re-count trigger
         check(
             "citation-density",
             density >= floor,

@@ -461,6 +461,28 @@ class TestTelemetryAndVerify:
         # instead of cited-source numbers would fail this check.
         assert by_name["citation-density"]["ok"]
 
+    def test_verify_density_floor_comes_from_profile(self, tmp_vault):
+        """`citation_density_min` used to be dead config (declared, never
+        read) while the gate hardcoded its own floor (#101). A profile
+        overlay must now move the gate."""
+        cfg = tmp_vault.root / ".hyperresearch" / "config.toml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text("[profile.light]\ncitation_density_min = 10000\n", encoding="utf-8")
+        init_run(tmp_vault, "vf-05", profile="light")
+        run_dir = tmp_vault.run_dir("vf-05")
+        (run_dir / "prompt-decomposition.json").write_text(json.dumps({
+            "response_format": "short",
+            "required_section_headings": ["## Findings"],
+        }), encoding="utf-8")
+        report = tmp_vault.root / "research" / "notes" / "final_report_vf-05.md"
+        body = "## Findings\n\n" + ("Substantive sentence with real evidence attached [[src-note]]. " * 80)
+        report.write_text(body, encoding="utf-8")
+
+        result = verify_run(tmp_vault, "vf-05")
+        by_name = {c["name"]: c for c in result["checks"]}
+        assert by_name["citation-density"]["ok"] is False
+        assert "floor 10000" in by_name["citation-density"]["detail"]
+
     def test_verify_fails_on_missing_heading_and_report(self, tmp_vault):
         init_run(tmp_vault, "vf-02", profile="light")
         result = verify_run(tmp_vault, "vf-02")

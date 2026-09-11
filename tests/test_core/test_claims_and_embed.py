@@ -101,6 +101,97 @@ class TestClaimsIngest:
         assert payload["count"] == 1
 
 
+def _write_claims(directory, note_id: str, *claims: str) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"claims-{note_id}.json").write_text(
+        json.dumps([{"claim": c} for c in claims]), encoding="utf-8"
+    )
+
+
+@pytest.fixture
+def run_scoped_vault(seeded_vault):
+    """Seeded vault whose claims live where the fetcher contract writes
+    them: research/runs/<vault_tag>/temp/ — two runs, nothing in the
+    legacy flat research/temp/."""
+    runs = seeded_vault.root / "research" / "runs"
+    _write_claims(runs / "run-a" / "temp", "python-async-patterns", "A1 async claim", "A2 async claim")
+    _write_claims(runs / "run-b" / "temp", "rust-ownership", "B1 ownership claim")
+    return seeded_vault
+
+
+class TestClaimsIngestRunWorkspace:
+    """#69 — the default scan must see the run workspace, not just research/temp/."""
+
+    def test_default_scan_finds_run_workspace_claims(self, run_scoped_vault):
+        assert not list((run_scoped_vault.root / "research" / "temp").glob("claims-*.json"))
+        summary = ingest_claims_dir(run_scoped_vault)
+        assert summary["files"] == 2
+        assert summary["ingested"] == 3
+        assert summary["errors"] == []
+        assert "hint" not in summary
+        assert len(list_claims(run_scoped_vault.db)) == 3
+
+    def test_default_scan_unions_legacy_flat_and_runs(self, run_scoped_vault):
+        _write_claims(run_scoped_vault.root / "research" / "temp", "concurrency", "Legacy flat claim")
+        summary = ingest_claims_dir(run_scoped_vault)
+        assert summary["files"] == 3
+        assert summary["ingested"] == 4
+        notes = {r["note_id"] for r in list_claims(run_scoped_vault.db)}
+        assert notes == {"python-async-patterns", "rust-ownership", "concurrency"}
+
+    def test_tag_narrows_to_that_run(self, run_scoped_vault):
+        summary = ingest_claims_dir(run_scoped_vault, vault_tag="run-a")
+        assert summary["files"] == 1
+        assert summary["ingested"] == 2
+        assert summary["scanned"] == [str(run_scoped_vault.root / "research" / "runs" / "run-a" / "temp")]
+        rows = list_claims(run_scoped_vault.db)
+        assert {r["note_id"] for r in rows} == {"python-async-patterns"}
+        assert {r["vault_tag"] for r in rows} == {"run-a"}
+
+    def test_tag_without_run_dir_falls_back_to_union(self, run_scoped_vault):
+        summary = ingest_claims_dir(run_scoped_vault, vault_tag="no-such-run")
+        assert summary["files"] == 2
+        assert summary["ingested"] == 3
+        assert {r["vault_tag"] for r in list_claims(run_scoped_vault.db)} == {"no-such-run"}
+
+    def test_explicit_dir_scans_only_itself(self, run_scoped_vault):
+        explicit = run_scoped_vault.root / "research" / "runs" / "run-b" / "temp"
+        summary = ingest_claims_dir(run_scoped_vault, temp_dir=explicit, vault_tag="run-a")
+        assert summary["files"] == 1
+        assert summary["ingested"] == 1
+        assert summary["scanned"] == [str(explicit)]
+        assert {r["note_id"] for r in list_claims(run_scoped_vault.db)} == {"rust-ownership"}
+
+    def test_zero_files_carries_hint(self, seeded_vault):
+        summary = ingest_claims_dir(seeded_vault)
+        assert summary["files"] == 0
+        assert "research/runs/<vault_tag>/temp/claims-<note-id>.json" in summary["hint"]
+
+    def test_cli_tag_form_used_by_width_sweep_skill(self, run_scoped_vault, monkeypatch):
+        from typer.testing import CliRunner
+
+        from hyperresearch.cli import app
+
+        monkeypatch.chdir(run_scoped_vault.root)
+        runner = CliRunner()
+        # Exact invocation from skills/hyperresearch-2-width-sweep.md
+        result = runner.invoke(app, ["claims", "ingest", "--tag", "run-a", "-j"])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["data"]["files"] == 1
+        assert payload["data"]["ingested"] == 2
+
+        result = runner.invoke(app, ["claims", "list", "--tag", "run-a", "--json"])
+        assert json.loads(result.stdout)["count"] == 2
+
+        # Human-readable zero-file case (run exists, no claims yet) surfaces the hint
+        (run_scoped_vault.root / "research" / "runs" / "run-empty" / "temp").mkdir(parents=True)
+        result = runner.invoke(app, ["claims", "ingest", "--tag", "run-empty"])
+        assert result.exit_code == 0, result.output
+        assert "from 0 file(s)" in result.output
+        assert "no claims-*.json found" in result.output
+
+
 class TestEmbeddings:
     def _fake_embedder(self, monkeypatch):
         """Deterministic fake: vector derived from text hash. Counts calls."""

@@ -37,6 +37,10 @@ Recovery used to ask Unpaywall, then Europe PMC. But `contact_email` is empty by
 
 The "Academic APIs before web search" section of the injected agent instructions tells agents to run `hpr scholar search` and not to hand-assemble API URLs, and explains what each source is for.
 
+### Contributed fixes
+
+- **`run finish` no longer blocks every light-classified run started on the installed gear (@maximilliangrand in #95).** `verify_run()` took its required-artifact step set from the manifest's `profile_steps`, so a run initialized with `--profile full` whose step-1 decomposition classified it `light` was asked for `critic-findings-*.json` and `patch-log.json` — artifacts the light tier correctly never writes, because steps 12 and 14 are skipped by the tier gate. The run did all its light-tier work and then sat at `blocked (verify)` with no legitimate way to pass. The gate now resolves the tier declared in `prompt-decomposition.json` when it disagrees with the manifest profile, which is what the router already documents ("the manifest's profile field is informational — the decomposition's tier rules"). A missing, unreadable or unknown tier still falls back to `profile_steps`.
+
 ## [0.10.1] - 2026-09-11
 
 A maintenance release. Everything here is a contributed fix, and two of them unblock users who could not ship a run at all.

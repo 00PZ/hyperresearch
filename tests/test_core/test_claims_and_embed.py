@@ -252,3 +252,114 @@ class TestEmbeddings:
     def test_vector_pack_roundtrip(self):
         vec = [0.5, -1.25, 3.0]
         assert embed._unpack(embed._pack(vec)) == vec
+
+
+class TestClaimsIngestHostileInput:
+    """Security review of #69: `--tag` is a CLI argument an agent may have
+    been talked into, and claims JSON is agent-written from fetched page
+    content. Neither may steer the scan outside the vault or crash it."""
+
+    def _texts(self, vault) -> set[str]:
+        return {c["claim"] for c in list_claims(vault.db)}
+
+    def test_relative_tag_cannot_escape_runs_dir(self, run_scoped_vault, tmp_path):
+        import os
+
+        from hyperresearch.core.claims import default_claims_dirs
+
+        vault = run_scoped_vault
+        outside = tmp_path / "outside-vault"
+        _write_claims(outside / "temp", "python-async-patterns", "OUTSIDE claim")
+        runs = vault.root / "research" / "runs"
+        escaping_tag = os.path.relpath(outside, runs)  # ../../..\\outside-vault
+        assert ".." in escaping_tag
+
+        dirs = [d.resolve() for d in default_claims_dirs(vault, escaping_tag)]
+        assert (outside / "temp").resolve() not in dirs
+        summary = ingest_claims_dir(vault, vault_tag=escaping_tag)
+        assert "OUTSIDE claim" not in self._texts(vault)
+        # Fell through to the default union of run workspaces.
+        assert summary["ingested"] == 3
+
+    def test_absolute_tag_cannot_escape_runs_dir(self, run_scoped_vault, tmp_path):
+        from hyperresearch.core.claims import default_claims_dirs
+
+        vault = run_scoped_vault
+        outside = tmp_path / "abs-outside"
+        _write_claims(outside / "temp", "python-async-patterns", "ABS OUTSIDE claim")
+        dirs = [d.resolve() for d in default_claims_dirs(vault, str(outside))]
+        assert (outside / "temp").resolve() not in dirs
+        ingest_claims_dir(vault, vault_tag=str(outside))
+        assert "ABS OUTSIDE claim" not in self._texts(vault)
+
+    def test_symlinked_claims_file_outside_vault_is_skipped(self, run_scoped_vault, tmp_path):
+        import os
+
+        from hyperresearch.core.claims import discover_claims_files
+
+        vault = run_scoped_vault
+        target = tmp_path / "elsewhere" / "claims-python-async-patterns.json"
+        target.parent.mkdir()
+        target.write_text(json.dumps([{"claim": "LINKED claim"}]), encoding="utf-8")
+        link = vault.root / "research" / "runs" / "run-b" / "temp" / "claims-python-async-patterns.json"
+        try:
+            os.symlink(target, link)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks unavailable on this host")
+        assert link.resolve() not in {f.resolve() for f in discover_claims_files(vault)}
+        ingest_claims_dir(vault)
+        assert "LINKED claim" not in self._texts(vault)
+
+    def test_oversized_claims_file_is_skipped_not_read(self, run_scoped_vault, monkeypatch):
+        from hyperresearch.core import claims as claims_mod
+
+        vault = run_scoped_vault
+        monkeypatch.setattr(claims_mod, "MAX_CLAIMS_FILE_BYTES", 64)
+        big = vault.root / "research" / "runs" / "run-a" / "temp" / "claims-python-async-patterns.json"
+        big.write_text(json.dumps([{"claim": "x" * 500}]), encoding="utf-8")
+        summary = ingest_claims_dir(vault)
+        assert any("limit 64" in e for e in summary["errors"])
+        assert "x" * 500 not in self._texts(vault)
+        assert summary["ingested"] == 1  # run-b still ingested
+
+    def test_malformed_claim_fields_do_not_abort_ingest(self, run_scoped_vault):
+        vault = run_scoped_vault
+        path = vault.root / "research" / "runs" / "run-a" / "temp" / "claims-python-async-patterns.json"
+        path.write_text(json.dumps([
+            {"claim": {"nested": "object"}},  # dict where prose belongs
+            {"claim": 12345},  # number where prose belongs
+            {"claim": ["a", "list"]},
+            {"claim": True},
+            {
+                "claim": "survives",
+                "confidence": [1, 2],  # unbindable
+                "quoted_support": {"x": 1},  # unbindable
+                "stance": 5,
+                "evidence_type": None,
+                "numbers": {"deep": [[[1]]]},
+            },
+            {"claim": "also survives", "confidence": 0.9, "quoted_support": "q"},
+            "not even a dict",
+            None,
+        ]), encoding="utf-8")
+        summary = ingest_claims_dir(vault)
+        assert summary["ingested"] == 3  # two here + run-b's one
+        assert {"survives", "also survives"} <= self._texts(vault)
+        assert summary["skipped"] >= 4
+
+    def test_overlong_claim_text_is_bounded(self, run_scoped_vault):
+        from hyperresearch.core.claims import MAX_CLAIM_FIELD_CHARS
+
+        vault = run_scoped_vault
+        path = vault.root / "research" / "runs" / "run-a" / "temp" / "claims-python-async-patterns.json"
+        path.write_text(json.dumps([{"claim": "y" * (MAX_CLAIM_FIELD_CHARS + 5000)}]), encoding="utf-8")
+        ingest_claims_dir(vault)
+        assert max(len(t) for t in self._texts(vault)) == MAX_CLAIM_FIELD_CHARS
+
+    def test_deeply_nested_json_is_an_error_not_a_crash(self, run_scoped_vault):
+        vault = run_scoped_vault
+        path = vault.root / "research" / "runs" / "run-a" / "temp" / "claims-python-async-patterns.json"
+        path.write_text("[" * 200_000 + "]" * 200_000, encoding="utf-8")
+        summary = ingest_claims_dir(vault)
+        assert any("unreadable JSON" in e for e in summary["errors"])
+        assert summary["ingested"] == 1

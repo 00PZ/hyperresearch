@@ -3,7 +3,51 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 from urllib.parse import urlparse
+
+
+def existing_live_note_for_url(conn: sqlite3.Connection, url: str) -> sqlite3.Row | None:
+    """Return the ``sources`` row for ``url`` only if it still points at a live note.
+
+    ``sources.note_id`` is ``ON DELETE SET NULL``, so deleting a note leaves its
+    row behind with ``note_id = NULL``. That orphan is not a duplicate — the url
+    may be fetched again — so this returns None both when the row is absent and
+    when it is orphaned. Every duplicate-url check must go through here rather
+    than testing row truthiness.
+    """
+    row = conn.execute("SELECT note_id FROM sources WHERE url = ?", (url,)).fetchone()
+    if row is None or row["note_id"] is None:
+        return None
+    return row
+
+
+def reclaim_orphaned_source_row(
+    conn: sqlite3.Connection,
+    url: str,
+    note_id: str,
+    domain: str,
+    fetched_at: str,
+    provider: str,
+    content_hash: str,
+) -> None:
+    """Point an orphaned ``sources`` row (``note_id IS NULL``) for ``url`` at ``note_id``.
+
+    The CLI fetch paths record a source with ``INSERT OR IGNORE`` so that a
+    duplicate-url race is a silent no-op instead of an IntegrityError. An
+    orphaned row makes that INSERT a no-op too, which would leave the freshly
+    written note with no source record (and, in ``fetch``, trip the race
+    detector into deleting it). Call this right after the INSERT: the
+    ``note_id IS NULL`` guard means it claims only an orphan and stays a no-op
+    when another fetch already owns the row, so the race semantics are unchanged.
+    """
+    conn.execute(
+        """UPDATE sources
+           SET note_id = ?, domain = ?, fetched_at = ?, provider = ?,
+               content_hash = ?, status = 'active'
+           WHERE url = ? AND note_id IS NULL""",
+        (note_id, domain, fetched_at, provider, content_hash, url),
+    )
 
 
 def fetch_and_save(
@@ -29,8 +73,8 @@ def fetch_and_save(
     tags = tags or []
     conn = vault.db
 
-    # Check if URL already fetched
-    existing = conn.execute("SELECT note_id FROM sources WHERE url = ?", (url,)).fetchone()
+    # Check if URL already fetched (an orphaned row — note deleted — is not a duplicate)
+    existing = existing_live_note_for_url(conn, url)
     if existing:
         raise ValueError(f"URL already fetched as note '{existing['note_id']}'")
 
@@ -157,11 +201,18 @@ def fetch_and_save(
     if plan.to_add or plan.to_update:
         execute_sync(vault, plan)
 
-    # Record source
+    # Record source (upsert: an orphaned row for this url may already exist)
     content_hash = hashlib.sha256(result.content.encode("utf-8")).hexdigest()[:16]
     conn.execute(
         """INSERT INTO sources (url, note_id, domain, fetched_at, provider, content_hash)
-           VALUES (?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(url) DO UPDATE SET
+               note_id = excluded.note_id,
+               domain = excluded.domain,
+               fetched_at = excluded.fetched_at,
+               provider = excluded.provider,
+               content_hash = excluded.content_hash,
+               status = 'active'""",
         (url, note_id, domain, result.fetched_at.isoformat(), prov.name, content_hash),
     )
     conn.commit()

@@ -206,3 +206,213 @@ class TestApiCache:
             "SELECT body FROM api_cache WHERE url = 'https://api.openalex.org/works/z'"
         ).fetchone()
         assert json.loads(row["body"]) == {"a": 1}
+
+
+# ---------------------------------------------------------------------------
+# 429 handling (#70) — patches httpx.get underneath _http_get_json, and
+# time.sleep so the backoff ladder never actually waits.
+# ---------------------------------------------------------------------------
+
+
+class _Resp:
+    def __init__(self, status: int, body: dict | None = None, headers: dict | None = None):
+        self.status_code = status
+        self._body = body or {}
+        self.headers = headers or {}
+
+    def json(self):
+        return self._body
+
+
+def _stub_httpx(monkeypatch, sequence: list[_Resp]):
+    """Serve canned responses in order; record every (url, headers) call."""
+    import httpx
+
+    calls: list[tuple[str, dict]] = []
+    queue = list(sequence)
+
+    def fake_get(url, **kwargs):
+        calls.append((url, dict(kwargs.get("headers") or {})))
+        return queue.pop(0) if queue else _Resp(200, {"ok": True})
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    return calls
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    slept: list[float] = []
+    monkeypatch.setattr(scholar.time, "sleep", lambda s: slept.append(s))
+    return slept
+
+
+S2_URL = "https://api.semanticscholar.org/graph/v1/paper/arXiv:2501.01234?fields=citationCount"
+
+
+def _arxiv_plus_doi_vault(tmp_vault):
+    from hyperresearch.core.note import write_note
+    from hyperresearch.core.sync import compute_sync_plan, execute_sync
+
+    write_note(
+        tmp_vault.notes_dir, "Arxiv Preprint", body="x",
+        extra_frontmatter={"doi": "arXiv:2501.01234"},
+    )
+    write_note(
+        tmp_vault.notes_dir, "Cited Paper", body="y", tier="institutional",
+        extra_frontmatter={"doi": "10.1/cited"},
+    )
+    plan = compute_sync_plan(tmp_vault, force=True)
+    execute_sync(tmp_vault, plan)
+    return tmp_vault
+
+
+def _s2_throttled(url: str):
+    if "semanticscholar" in url:
+        raise scholar.RateLimitedError("api.semanticscholar.org", 3)
+    return OPENALEX_CITED
+
+
+class TestRateLimitRetry:
+    def test_429_then_success_retries_with_backoff(self, monkeypatch, no_sleep):
+        calls = _stub_httpx(monkeypatch, [_Resp(429), _Resp(429), _Resp(200, {"citationCount": 3})])
+        assert scholar._http_get_json(S2_URL) == {"citationCount": 3}
+        assert len(calls) == 3
+        assert no_sleep == [2.0, 4.0]
+
+    def test_429_exhausted_raises_rate_limited(self, monkeypatch, no_sleep):
+        calls = _stub_httpx(monkeypatch, [_Resp(429), _Resp(429), _Resp(429)])
+        with pytest.raises(scholar.RateLimitedError) as exc:
+            scholar._http_get_json(S2_URL)
+        assert len(calls) == 3
+        assert exc.value.host == "api.semanticscholar.org"
+        assert exc.value.attempts == 3
+        assert no_sleep == [2.0, 4.0]
+
+    def test_retry_after_header_is_honoured(self, monkeypatch, no_sleep):
+        _stub_httpx(monkeypatch, [_Resp(429, headers={"Retry-After": "7"}), _Resp(200, {"a": 1})])
+        assert scholar._http_get_json(S2_URL) == {"a": 1}
+        assert no_sleep == [7.0]
+
+    def test_insane_retry_after_falls_back_to_ladder(self, monkeypatch, no_sleep):
+        _stub_httpx(monkeypatch, [
+            _Resp(429, headers={"Retry-After": "86400"}),
+            _Resp(429, headers={"Retry-After": "Fri, 31 Dec 1999 23:59:59 GMT"}),
+            _Resp(200, {"a": 1}),
+        ])
+        scholar._http_get_json(S2_URL)
+        assert no_sleep == [2.0, 4.0]
+
+    def test_other_non_200_stays_soft_none_without_retry(self, monkeypatch, no_sleep):
+        for status in (404, 500, 503):
+            calls = _stub_httpx(monkeypatch, [_Resp(status)])
+            assert scholar._http_get_json(S2_URL) is None
+            assert len(calls) == 1
+        assert no_sleep == []
+
+    def test_rate_limit_is_not_cached(self, tmp_vault, monkeypatch, no_sleep):
+        _stub_httpx(monkeypatch, [_Resp(429)] * 3)
+        with pytest.raises(scholar.RateLimitedError):
+            scholar._fetch_json(tmp_vault.db, S2_URL, ttl_days=30)
+        row = tmp_vault.db.execute("SELECT 1 FROM api_cache WHERE url = ?", (S2_URL,)).fetchone()
+        assert row is None
+
+
+class TestRateLimitInScoreSources:
+    def test_exhausted_429_lands_in_rate_limited_not_missing(self, tmp_vault, monkeypatch):
+        vault = _arxiv_plus_doi_vault(tmp_vault)
+        monkeypatch.setattr(scholar, "_http_get_json", _s2_throttled)
+        result = scholar.score_sources(vault)
+        assert result["scored"] == 1
+        assert result["rate_limited"] == ["arxiv-preprint"]
+        assert result["missing"] == []
+        # Not marked enriched -> a later run retries it
+        row = vault.db.execute(
+            "SELECT citation_count FROM notes WHERE id = 'arxiv-preprint'"
+        ).fetchone()
+        assert row["citation_count"] is None
+
+    def test_doi_fallback_to_s2_that_is_throttled_is_rate_limited(self, doi_vault, monkeypatch):
+        # OpenAlex has nothing, the S2 fallback is throttled -> rate_limited, not missing
+        def fake_get(url):
+            if "semanticscholar" in url:
+                raise scholar.RateLimitedError("api.semanticscholar.org", 3)
+            return None
+
+        monkeypatch.setattr(scholar, "_http_get_json", fake_get)
+        result = scholar.score_sources(doi_vault)
+        assert sorted(result["rate_limited"]) == ["cited-paper", "retracted-paper"]
+        assert result["missing"] == []
+
+    def test_summary_key_present_when_nothing_throttled(self, doi_vault, monkeypatch):
+        _stub_openalex(monkeypatch, {})
+        result = scholar.score_sources(doi_vault)
+        assert result["rate_limited"] == []
+        assert len(result["missing"]) == 2
+
+    def test_cli_reports_rate_limit_distinctly(self, tmp_vault, monkeypatch):
+        from typer.testing import CliRunner
+
+        from hyperresearch.cli import app
+
+        vault = _arxiv_plus_doi_vault(tmp_vault)
+        monkeypatch.setattr(scholar, "_http_get_json", _s2_throttled)
+        monkeypatch.chdir(vault.root)
+        result = CliRunner().invoke(app, ["sources", "score"])
+        assert result.exit_code == 0, result.output
+        assert "Rate-limited" in result.output
+        assert "No metadata found" not in result.output
+
+        result = CliRunner().invoke(app, ["sources", "score", "--fresh", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["data"]["rate_limited"] == ["arxiv-preprint"]
+
+        result = CliRunner().invoke(app, ["sources", "retractions", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["data"]["rate_limited"] == 1
+
+
+class TestSemanticScholarApiKey:
+    def test_key_attached_only_to_semanticscholar_host(self, monkeypatch, no_sleep):
+        monkeypatch.setenv("S2_API_KEY", "sekrit")
+        calls = _stub_httpx(monkeypatch, [])
+        others = [
+            "https://api.openalex.org/works/doi:10.1%2Fx",
+            "https://api.unpaywall.org/v2/10.1%2Fx?email=a@b.c",
+            "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=x",
+            "https://evil.example.com/semanticscholar.org/steal",
+            "https://semanticscholar.org.evil.example.com/steal",
+        ]
+        scholar._http_get_json(S2_URL)
+        for url in others:
+            scholar._http_get_json(url)
+        by_url = dict(calls)
+        assert by_url[S2_URL]["x-api-key"] == "sekrit"
+        assert by_url[S2_URL]["User-Agent"].startswith("hyperresearch")
+        for url in others:
+            assert "x-api-key" not in by_url[url], url
+
+    def test_alternate_env_name_and_no_key(self, monkeypatch, no_sleep):
+        monkeypatch.delenv("S2_API_KEY", raising=False)
+        monkeypatch.setenv("SEMANTIC_SCHOLAR_API_KEY", "alt")
+        calls = _stub_httpx(monkeypatch, [])
+        scholar._http_get_json(S2_URL)
+        assert calls[0][1]["x-api-key"] == "alt"
+
+        monkeypatch.delenv("SEMANTIC_SCHOLAR_API_KEY")
+        calls = _stub_httpx(monkeypatch, [])
+        scholar._http_get_json(S2_URL)
+        assert "x-api-key" not in calls[0][1]
+
+
+class TestOaResolversStaySoft:
+    def test_rate_limit_means_no_oa_copy(self, tmp_vault, monkeypatch):
+        from hyperresearch.core import oa
+
+        def fake_get(url):
+            raise scholar.RateLimitedError("api.unpaywall.org", 3)
+
+        monkeypatch.setattr(scholar, "_http_get_json", fake_get)
+        assert oa._resolve_europepmc(tmp_vault.db, "10.1/x", 30, False) is None
+        assert list(oa._unpaywall_candidates(tmp_vault.db, "10.1/x", 30, "a@b.c", True, False)) == []

@@ -8,10 +8,20 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.11", "3.12", "3.13"]
+        include:
+          # The maintainer develops on Windows; socket, path and signal
+          # semantics differ enough (#104) that ubuntu-only checks cannot
+          # catch a class of bug that shows up locally every day. One
+          # Windows job on the version used locally keeps that coverage
+          # without tripling the matrix.
+          - os: windows-latest
+            python-version: "3.11"
 
     steps:
       - uses: actions/checkout@v7
@@ -21,4 +31,4 @@ jobs:
       - run: pip install -e ".[dev]" build
       - run: ruff check src/ tests/
       - run: pytest tests/ -v
-      - run: python -m build --outdir /tmp/hyperresearch-dist
+      - run: python -m build --outdir ${{ runner.temp }}/hyperresearch-dist

@@ -43,10 +43,30 @@ def _lacks_word_boundaries(text: str) -> bool:
     return avg_token_chars >= _NO_WORD_BOUNDARY_AVG_TOKEN_CHARS
 
 
+def _effective_word_count(text: str, chars_per_word: float) -> float:
+    """Script-neutral word count: `str.split()` where whitespace delimits
+    words, else characters / `chars_per_word` (the profile's ratio for
+    scripts like Chinese, Japanese or Thai). Korean is space-delimited and
+    takes the split path."""
+    if _lacks_word_boundaries(text):
+        return len(text) / chars_per_word
+    return len(text.split())
+
+
 EVENTS_NAME = "events.jsonl"
 
 RUN_STATUSES = ("running", "paused", "blocked", "done", "failed", "aborted")
 STEP_STATUSES = ("pending", "running", "done", "skipped", "failed")
+
+# Step 1.5 (chapter partition) registers each chapter by emitting this event
+# type with {"chapter": <id>, "title": <title>}; record_event folds it into
+# manifest["chapters"] so resume_position sees the chapter as pending. This
+# is the ONLY registration path — there is no separate chapter command.
+CHAPTER_PLAN_EVENT = "chapter-plan"
+
+# Chaptered profiles loop steps 2..10 per chapter (see the step-1.5 skill's
+# "Chapter execution loop"); a chapter is complete once its step 10 is done.
+CHAPTER_LAST_STEP = "10"
 
 # A run whose manifest hasn't been touched in this long is flagged
 # possibly-stalled by `hpr run status`.
@@ -134,7 +154,14 @@ def _save(vault, vault_tag: str, manifest: dict) -> None:
 
 
 def record_event(vault, vault_tag: str, event: dict) -> None:
-    """Append one event to events.jsonl and touch the manifest heartbeat."""
+    """Append one event to events.jsonl and touch the manifest heartbeat.
+
+    A `chapter-plan` event (step 1.5) also registers its chapter in
+    `manifest["chapters"]` — status "planned", plus the title when given —
+    so the manifest, not the events log, stays the single input to
+    `resume_position`. Re-emitting the event for a chapter that already
+    has step progress never regresses its status.
+    """
     run_dir = vault.run_dir(vault_tag)
     if not (run_dir / MANIFEST_NAME).exists():
         raise RunError(f"no run '{vault_tag}'")
@@ -142,6 +169,11 @@ def record_event(vault, vault_tag: str, event: dict) -> None:
     with open(run_dir / EVENTS_NAME, "a", encoding="utf-8") as f:
         f.write(json.dumps(event) + "\n")
     manifest = load_manifest(vault, vault_tag)
+    if event.get("type") == CHAPTER_PLAN_EVENT and event.get("chapter"):
+        ch = manifest.setdefault("chapters", {}).setdefault(str(event["chapter"]), {})
+        ch.setdefault("status", "planned")
+        if event.get("title"):
+            ch["title"] = event["title"]
     _save(vault, vault_tag, manifest)  # heartbeat
 
 
@@ -168,15 +200,6 @@ def set_step(
         ch["status"] = f"step-{step}-{status}"
     _save(vault, vault_tag, manifest)
     record_event(vault, vault_tag, {"type": "step", "step": str(step), "status": status, "chapter": chapter})
-    return manifest
-
-
-def set_chapter(vault, vault_tag: str, chapter: str, **fields) -> dict:
-    """Create/update a chapter entry (title, status, sources, ...)."""
-    manifest = load_manifest(vault, vault_tag)
-    ch = manifest["chapters"].setdefault(chapter, {})
-    ch.update({k: v for k, v in fields.items() if v is not None})
-    _save(vault, vault_tag, manifest)
     return manifest
 
 
@@ -244,16 +267,20 @@ def resume_position(manifest: dict) -> dict:
     """Compute where a run should continue.
 
     Returns {next_step, done_steps, remaining_steps, chapters_pending}.
-    next_step is None when every profile step is done.
+    next_step is None when every profile step is done. A registered
+    chapter (see CHAPTER_PLAN_EVENT) stays pending until its last looped
+    step is done — `set_step(..., chapter=)` records "step-<N>-done" per
+    step, and only step CHAPTER_LAST_STEP closes the chapter.
     """
     profile_steps = manifest.get("profile_steps", [])
     steps = manifest.get("steps", {})
     done = [s for s in profile_steps if steps.get(s, {}).get("status") in ("done", "skipped")]
     remaining = [s for s in profile_steps if s not in done]
+    chapter_done = ("done", f"step-{CHAPTER_LAST_STEP}-done")
     chapters_pending = [
         name
         for name, ch in manifest.get("chapters", {}).items()
-        if ch.get("status") not in ("done", None) and not str(ch.get("status", "")).endswith("-done")
+        if ch.get("status") not in chapter_done
     ]
     return {
         "next_step": remaining[0] if remaining else None,
@@ -443,14 +470,15 @@ def verify_run(vault, vault_tag: str) -> dict:
         if response_format and response_format in profile.word_targets:
             if _lacks_word_boundaries(report_text):
                 # char_targets_no_word_boundary is profile-configurable per
-                # response_format; falls back to word_target * 3 (a CJK-shaped
-                # guess) if a format has no explicit target.
-                char_targets = getattr(profile, "char_targets_no_word_boundary", None) or {}
+                # response_format; falls back to word_target * chars_per_word
+                # if a format has no explicit target.
+                char_targets = profile.char_targets_no_word_boundary
                 if response_format in char_targets:
                     low, high = char_targets[response_format]
                 else:
                     low_w, high_w = profile.word_targets[response_format]
-                    low, high = low_w * 3, high_w * 3
+                    ratio = profile.chars_per_word_no_word_boundary
+                    low, high = int(low_w * ratio), int(high_w * ratio)
                 count = len(report_text)
                 check(
                     "length-in-range",
@@ -475,18 +503,35 @@ def verify_run(vault, vault_tag: str) -> dict:
 
         import re as _re
 
+        from hyperresearch.core.patterns import WIKI_LINK_RE
+
         # Grouped markers ([7, 12]) count one citation per source number,
-        # so consolidating stacks never lowers measured density.
+        # so consolidating stacks never lowers measured density. Wiki-link
+        # citations use the shared pattern so this gate and the lint/cite-
+        # check rules agree on what a [[...]] citation is.
         cites = sum(
             len(g.split(","))
             for g in _re.findall(r"\[(\d{1,3}(?:\s*,\s*\d{1,3})*)\]", report_text)
-        ) + len(_re.findall(r"\[\[[^\]]+\]\]", report_text))
-        density = cites / max(1, len(report_text)) * 1000
-        floor = 1.5  # instruction-critic's re-count trigger
+        ) + len(WIKI_LINK_RE.findall(report_text))
+        # Per 1000 *effective* words, not characters: a character floor
+        # means a different amount of content per script (CJK packs ~3x
+        # the content per character), so the same number would be a
+        # different bar for a Japanese report than for an English one.
+        no_boundaries = _lacks_word_boundaries(report_text)
+        effective_words = _effective_word_count(
+            report_text, profile.chars_per_word_no_word_boundary
+        )
+        density = cites * 1000 / max(1.0, effective_words)
+        floor = profile.citation_density_min  # also the instruction critic's re-count trigger
+        unit = (
+            f"words (chars / {profile.chars_per_word_no_word_boundary:g}; no word boundaries)"
+            if no_boundaries
+            else "words"
+        )
         check(
             "citation-density",
             density >= floor,
-            f"{density:.2f} citations/1000 chars (floor {floor})",
+            f"{density:.2f} citations/1000 {unit} (floor {floor})",
         )
 
         check(

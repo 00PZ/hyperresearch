@@ -1,10 +1,12 @@
 """Claims persistence — fetcher-extracted claims as queryable DB rows.
 
-Fetchers write `research/temp/claims-<note-id>.json` files during step 2.
-This module ingests them into the `claims` (+ `claims_fts`) tables, keyed to
-their source notes, so downstream consumers can ask "which source best
-supports X" as a query instead of re-parsing JSON files. This is the
-substrate for phase-5 cite-checking and numeric-consistency lints.
+Fetchers write `research/runs/<vault_tag>/temp/claims-<note-id>.json` files
+during step 2 (and step 13's gap fetch); the legacy flat location
+`research/temp/claims-*.json` is still honoured. This module ingests them
+into the `claims` (+ `claims_fts`) tables, keyed to their source notes, so
+downstream consumers can ask "which source best supports X" as a query
+instead of re-parsing JSON files. This is the substrate for phase-5
+cite-checking and numeric-consistency lints.
 
 Ingest is idempotent: rows are keyed by (note_id, sha256(claim)[:16]), so
 re-running over the same files is a no-op.
@@ -99,13 +101,75 @@ def ingest_claims_file(conn, path: Path, vault_tag: str | None = None) -> dict:
     return result
 
 
+def _glob_claims(directory: Path) -> list[Path]:
+    return sorted(directory.glob("claims-*.json")) if directory.is_dir() else []
+
+
+def default_claims_dirs(vault, vault_tag: str | None = None) -> list[Path]:
+    """Directories a default (no explicit `temp_dir`) ingest scans.
+
+    With a `vault_tag` whose run workspace exists, exactly that run's
+    `research/runs/<vault_tag>/temp/`. Otherwise the union of the legacy
+    flat `research/temp/` and every `research/runs/*/temp/` — the fetcher
+    contract writes claims into the run workspace, so a scan limited to
+    the flat directory sees nothing in a real run.
+    """
+    research = vault.root / "research"
+    if vault_tag:
+        run_temp = research / "runs" / vault_tag / "temp"
+        if run_temp.is_dir():
+            return [run_temp]
+    dirs = [research / "temp"]
+    runs = research / "runs"
+    if runs.is_dir():
+        dirs.extend(sorted(d / "temp" for d in runs.iterdir() if d.is_dir()))
+    return dirs
+
+
+def discover_claims_files(vault, vault_tag: str | None = None) -> list[Path]:
+    """Every claims-*.json a default ingest would read, deduplicated by
+    resolved path and sorted."""
+    seen: set[Path] = set()
+    files: list[Path] = []
+    for d in default_claims_dirs(vault, vault_tag):
+        for f in _glob_claims(d):
+            key = f.resolve()
+            if key in seen:
+                continue
+            seen.add(key)
+            files.append(f)
+    return sorted(files)
+
+
 def ingest_claims_dir(vault, temp_dir: Path | None = None, vault_tag: str | None = None) -> dict:
-    """Ingest every claims-*.json under research/temp/. Returns a summary."""
+    """Ingest claims-*.json files. Returns a summary.
+
+    `temp_dir` given: scan exactly that directory (no recursion). Otherwise
+    scan `default_claims_dirs(vault, vault_tag)` — the run workspace for
+    `vault_tag` when it exists, else legacy `research/temp/` plus every
+    `research/runs/*/temp/`. `vault_tag` is also stamped on every row.
+    """
     conn = vault.db
     if temp_dir is None:
-        temp_dir = vault.root / "research" / "temp"
-    files = sorted(temp_dir.glob("claims-*.json")) if temp_dir.is_dir() else []
-    summary = {"files": len(files), "ingested": 0, "skipped": 0, "errors": []}
+        scanned = default_claims_dirs(vault, vault_tag)
+        files = discover_claims_files(vault, vault_tag)
+    else:
+        scanned = [temp_dir]
+        files = _glob_claims(temp_dir)
+    summary = {
+        "files": len(files),
+        "ingested": 0,
+        "skipped": 0,
+        "errors": [],
+        "scanned": [str(d) for d in scanned],
+    }
+    if not files:
+        summary["hint"] = (
+            "no claims-*.json found under "
+            + ", ".join(summary["scanned"])
+            + "; fetchers write research/runs/<vault_tag>/temp/claims-<note-id>.json "
+            "-- pass --tag <vault_tag> or the files explicitly"
+        )
     for f in files:
         r = ingest_claims_file(conn, f, vault_tag)
         summary["ingested"] += r["ingested"]

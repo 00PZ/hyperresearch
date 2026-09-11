@@ -203,6 +203,8 @@ def test_premier_gear_renders_cleanly(skill_name):
     if skill_name == "hyperresearch":
         assert "currently `premier`" in rendered
         assert "~3–5 hours" in rendered
+        # The step table's counts follow the gear (premier: 3 loci-analysts).
+        assert "| 3 loci-analysts → scored loci.json" in rendered
     if skill_name == "hyperresearch-4-loci-analysis":
         # premier spawns 3 analysts and clamps to 10 loci; nothing in the
         # prose may still assume two analysts or six loci (#101).

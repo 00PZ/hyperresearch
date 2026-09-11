@@ -169,12 +169,48 @@ def record_event(vault, vault_tag: str, event: dict) -> None:
     with open(run_dir / EVENTS_NAME, "a", encoding="utf-8") as f:
         f.write(json.dumps(event) + "\n")
     manifest = load_manifest(vault, vault_tag)
-    if event.get("type") == CHAPTER_PLAN_EVENT and event.get("chapter"):
-        ch = manifest.setdefault("chapters", {}).setdefault(str(event["chapter"]), {})
-        ch.setdefault("status", "planned")
-        if event.get("title"):
-            ch["title"] = event["title"]
+    if event.get("type") == CHAPTER_PLAN_EVENT:
+        _fold_chapter_plan(manifest, event)
     _save(vault, vault_tag, manifest)  # heartbeat
+
+
+# Bounds on what a chapter-plan event may write into the manifest. Events
+# come from `hpr run event --data <json>` — agent-authored, so the payload
+# shape is not trusted: only a short scalar chapter id and a short string
+# title are folded; every other key is left in events.jsonl.
+CHAPTER_ID_MAX_CHARS = 64
+CHAPTER_TITLE_MAX_CHARS = 500
+
+
+def _chapter_id_of(value) -> str | None:
+    """A chapter id is a short non-empty string or int; anything else is
+    ignored (bools, floats, lists, dicts, None)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        value = str(value)
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or len(value) > CHAPTER_ID_MAX_CHARS:
+        return None
+    return value
+
+
+def _fold_chapter_plan(manifest: dict, event: dict) -> None:
+    chapter = _chapter_id_of(event.get("chapter"))
+    if chapter is None:
+        return
+    chapters = manifest.get("chapters")
+    if not isinstance(chapters, dict):
+        chapters = manifest["chapters"] = {}
+    ch = chapters.get(chapter)
+    if not isinstance(ch, dict):
+        ch = chapters[chapter] = {}
+    ch.setdefault("status", "planned")
+    title = event.get("title")
+    if isinstance(title, str) and title.strip():
+        ch["title"] = title.strip()[:CHAPTER_TITLE_MAX_CHARS]
 
 
 def set_step(
@@ -277,10 +313,13 @@ def resume_position(manifest: dict) -> dict:
     done = [s for s in profile_steps if steps.get(s, {}).get("status") in ("done", "skipped")]
     remaining = [s for s in profile_steps if s not in done]
     chapter_done = ("done", f"step-{CHAPTER_LAST_STEP}-done")
+    chapters = manifest.get("chapters")
+    if not isinstance(chapters, dict):
+        chapters = {}
     chapters_pending = [
         name
-        for name, ch in manifest.get("chapters", {}).items()
-        if ch.get("status") not in chapter_done
+        for name, ch in chapters.items()
+        if not isinstance(ch, dict) or ch.get("status") not in chapter_done
     ]
     return {
         "next_step": remaining[0] if remaining else None,

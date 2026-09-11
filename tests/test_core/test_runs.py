@@ -361,3 +361,70 @@ class TestWorkspaceIsolation:
         names = [f.name for f in files]
         assert names[0] == "query.md"  # newest run first
         assert "query-old-tag.md" in names
+
+
+class TestChapterPlanEventHardening:
+    """Security review of #100: `hpr run event --data` is agent-authored
+    JSON. A crafted chapter-plan payload must not corrupt the manifest or
+    crash `resume_position`; only a short scalar id and string title fold."""
+
+    def _event(self, vault, tag, **payload):
+        from hyperresearch.core.runs import record_event
+
+        record_event(vault, tag, {"type": "chapter-plan", **payload})
+
+    def test_non_scalar_chapter_ids_are_ignored(self, tmp_vault):
+        init_run(tmp_vault, "hard-000001", profile="dissertation")
+        for bad in ({"a": 1}, ["ch1"], 1.5, True, None, "", "   ", "x" * 65):
+            self._event(tmp_vault, "hard-000001", chapter=bad, title="T")
+        assert load_manifest(tmp_vault, "hard-000001")["chapters"] == {}
+        assert resume_position(load_manifest(tmp_vault, "hard-000001"))["chapters_pending"] == []
+
+    def test_int_chapter_id_and_whitespace_are_normalised(self, tmp_vault):
+        init_run(tmp_vault, "hard-000002", profile="dissertation")
+        self._event(tmp_vault, "hard-000002", chapter=3, title="Three")
+        self._event(tmp_vault, "hard-000002", chapter="  ch4 ", title="Four")
+        chapters = load_manifest(tmp_vault, "hard-000002")["chapters"]
+        assert set(chapters) == {"3", "ch4"}
+
+    def test_non_string_or_huge_titles_are_dropped_or_bounded(self, tmp_vault):
+        from hyperresearch.core.runs import CHAPTER_TITLE_MAX_CHARS
+
+        init_run(tmp_vault, "hard-000003", profile="dissertation")
+        self._event(tmp_vault, "hard-000003", chapter="ch1", title={"evil": "dict"})
+        self._event(tmp_vault, "hard-000003", chapter="ch2", title=["list"])
+        self._event(tmp_vault, "hard-000003", chapter="ch3", title="t" * 10_000)
+        chapters = load_manifest(tmp_vault, "hard-000003")["chapters"]
+        assert chapters["ch1"] == {"status": "planned"}
+        assert chapters["ch2"] == {"status": "planned"}
+        assert len(chapters["ch3"]["title"]) == CHAPTER_TITLE_MAX_CHARS
+
+    def test_extra_payload_keys_never_reach_the_manifest(self, tmp_vault):
+        init_run(tmp_vault, "hard-000004", profile="dissertation")
+        self._event(
+            tmp_vault, "hard-000004", chapter="ch1", title="T",
+            status="done", steps={"2": {"status": "done"}}, profile_steps=[], spend={"usd": 1},
+        )
+        manifest = load_manifest(tmp_vault, "hard-000004")
+        assert manifest["chapters"]["ch1"] == {"status": "planned", "title": "T"}
+        assert manifest["profile_steps"]  # untouched
+        assert resume_position(manifest)["chapters_pending"] == ["ch1"]
+
+    def test_corrupt_chapters_shape_is_repaired_not_crashed(self, tmp_vault):
+        init_run(tmp_vault, "hard-000005", profile="dissertation")
+        mpath = runs_mod.manifest_path(tmp_vault, "hard-000005")
+        manifest = json.loads(mpath.read_text(encoding="utf-8"))
+        manifest["chapters"] = ["not", "a", "dict"]
+        mpath.write_text(json.dumps(manifest), encoding="utf-8")
+        assert resume_position(manifest)["chapters_pending"] == []
+        self._event(tmp_vault, "hard-000005", chapter="ch1", title="T")
+        manifest = load_manifest(tmp_vault, "hard-000005")
+        assert manifest["chapters"] == {"ch1": {"status": "planned", "title": "T"}}
+
+        manifest["chapters"]["ch2"] = "planned"  # scalar entry
+        assert resume_position(manifest)["chapters_pending"] == ["ch1", "ch2"]
+        mpath.write_text(json.dumps(manifest), encoding="utf-8")
+        self._event(tmp_vault, "hard-000005", chapter="ch2", title="Two")
+        assert load_manifest(tmp_vault, "hard-000005")["chapters"]["ch2"] == {
+            "status": "planned", "title": "Two",
+        }

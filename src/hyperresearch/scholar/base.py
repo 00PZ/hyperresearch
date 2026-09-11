@@ -276,6 +276,34 @@ def fetch_json(
 
 
 # ---------------------------------------------------------------------------
+# Defensive coercion — every upstream returns the wrong type somewhere
+# ---------------------------------------------------------------------------
+
+
+def as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def as_str(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def as_int(value: Any) -> int | None:
+    # bool is an int subclass and would otherwise become 0/1 silently — a
+    # stray `true` in a citation-count field must not turn into "1 citation".
+    if isinstance(value, bool):
+        return None
+    return value if isinstance(value, int) else None
+
+
+# ---------------------------------------------------------------------------
 # Provider contract
 # ---------------------------------------------------------------------------
 

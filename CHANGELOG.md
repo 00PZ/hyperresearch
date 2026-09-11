@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-09-11
+
 ### Seven fixes from the backlog sweep
 
 - **Markdown links no longer mint stub notes (#93, reported by @ThiagoMafra-Integrare).** `[[Label]](https://…)` — everywhere on GitHub READMEs, awesome-lists and Wikipedia-shaped pages — parsed as a wikilink, and `repair --stub` (default on, and mandated after every session) turned each one into a real note that then topped `_most-linked` and inflated PageRank. `WIKI_LINK_RE` now refuses a `]]` immediately followed by `(`; the hygiene filter also rejects unsubstituted `{…}` placeholders and unbalanced brackets. Resolver-minted stubs are excluded from both rankers and have their stale centrality zeroed, so vaults polluted before this fix recover on the next `graph rank`. The stub marker is centralized so the minting sites and the filter cannot drift.

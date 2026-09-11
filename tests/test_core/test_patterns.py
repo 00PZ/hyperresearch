@@ -143,3 +143,48 @@ def test_real_words_that_look_like_roman_are_accepted():
     # Longer words containing roman chars are fine
     assert is_valid_wiki_link_target("civic")
     assert is_valid_wiki_link_target("minimalism")
+
+
+# --- issue #93: [[Label]](url) is a markdown link, not a wiki-link ---------
+
+
+def _targets(text: str) -> list[str]:
+    from hyperresearch.core.patterns import WIKI_LINK_RE
+
+    return [m.group(1) for m in WIKI_LINK_RE.finditer(text)]
+
+
+def test_bracketed_markdown_link_label_is_not_a_wikilink():
+    # GitHub READMEs / awesome-lists: the *label* is bracketed, the whole
+    # thing is a markdown link. Must not be extracted as a wiki-link.
+    assert _targets("[[Label]](https://example.com)") == []
+    assert _targets("see [[100]](https://en.wikipedia.org/wiki/Foo#cite_note-100)") == []
+    assert _targets("[[Some Repo|alias]](https://github.com/x/y)") == []
+
+
+def test_wikilink_followed_by_spaced_parenthetical_still_matches():
+    # A real wiki-link is never *immediately* followed by "(" — but a
+    # parenthetical after a space is ordinary prose and must keep working.
+    assert _targets("[[note]] (2024)") == ["note"]
+    assert _targets("[[note|Display]] (see also)") == ["note"]
+    # Mixed line: the markdown link is skipped, the real link survives.
+    assert _targets("[[Label]](https://x) and [[real-note]]") == ["real-note"]
+
+
+def test_template_placeholders_rejected():
+    # Unsubstituted skill-prompt placeholders leaking into a note body.
+    assert not is_valid_wiki_link_target("{note_id}")
+    assert not is_valid_wiki_link_target("run-{vault_tag}")
+    assert not is_valid_wiki_link_target("interim-report-{locus-name}")
+    # Braces that are balanced-but-empty are still a placeholder shape.
+    assert not is_valid_wiki_link_target("{}")
+
+
+def test_unbalanced_brackets_rejected():
+    # `[[t.IO[t.Any]]` — a type annotation whose closing "]" was eaten by
+    # the "]]" delimiter; the captured ref has one "[" and no "]".
+    assert not is_valid_wiki_link_target("t.IO[t.Any")
+    assert not is_valid_wiki_link_target("list[str")
+    assert not is_valid_wiki_link_target("foo]")
+    # Balanced brackets inside an id are unusual but not a parse artifact.
+    assert is_valid_wiki_link_target("array[0]-semantics")

@@ -48,6 +48,16 @@ EVENTS_NAME = "events.jsonl"
 RUN_STATUSES = ("running", "paused", "blocked", "done", "failed", "aborted")
 STEP_STATUSES = ("pending", "running", "done", "skipped", "failed")
 
+# Step 1.5 (chapter partition) registers each chapter by emitting this event
+# type with {"chapter": <id>, "title": <title>}; record_event folds it into
+# manifest["chapters"] so resume_position sees the chapter as pending. This
+# is the ONLY registration path — there is no separate chapter command.
+CHAPTER_PLAN_EVENT = "chapter-plan"
+
+# Chaptered profiles loop steps 2..10 per chapter (see the step-1.5 skill's
+# "Chapter execution loop"); a chapter is complete once its step 10 is done.
+CHAPTER_LAST_STEP = "10"
+
 # A run whose manifest hasn't been touched in this long is flagged
 # possibly-stalled by `hpr run status`.
 STALL_MINUTES = 30
@@ -134,7 +144,14 @@ def _save(vault, vault_tag: str, manifest: dict) -> None:
 
 
 def record_event(vault, vault_tag: str, event: dict) -> None:
-    """Append one event to events.jsonl and touch the manifest heartbeat."""
+    """Append one event to events.jsonl and touch the manifest heartbeat.
+
+    A `chapter-plan` event (step 1.5) also registers its chapter in
+    `manifest["chapters"]` — status "planned", plus the title when given —
+    so the manifest, not the events log, stays the single input to
+    `resume_position`. Re-emitting the event for a chapter that already
+    has step progress never regresses its status.
+    """
     run_dir = vault.run_dir(vault_tag)
     if not (run_dir / MANIFEST_NAME).exists():
         raise RunError(f"no run '{vault_tag}'")
@@ -142,6 +159,11 @@ def record_event(vault, vault_tag: str, event: dict) -> None:
     with open(run_dir / EVENTS_NAME, "a", encoding="utf-8") as f:
         f.write(json.dumps(event) + "\n")
     manifest = load_manifest(vault, vault_tag)
+    if event.get("type") == CHAPTER_PLAN_EVENT and event.get("chapter"):
+        ch = manifest.setdefault("chapters", {}).setdefault(str(event["chapter"]), {})
+        ch.setdefault("status", "planned")
+        if event.get("title"):
+            ch["title"] = event["title"]
     _save(vault, vault_tag, manifest)  # heartbeat
 
 
@@ -168,15 +190,6 @@ def set_step(
         ch["status"] = f"step-{step}-{status}"
     _save(vault, vault_tag, manifest)
     record_event(vault, vault_tag, {"type": "step", "step": str(step), "status": status, "chapter": chapter})
-    return manifest
-
-
-def set_chapter(vault, vault_tag: str, chapter: str, **fields) -> dict:
-    """Create/update a chapter entry (title, status, sources, ...)."""
-    manifest = load_manifest(vault, vault_tag)
-    ch = manifest["chapters"].setdefault(chapter, {})
-    ch.update({k: v for k, v in fields.items() if v is not None})
-    _save(vault, vault_tag, manifest)
     return manifest
 
 
@@ -244,16 +257,20 @@ def resume_position(manifest: dict) -> dict:
     """Compute where a run should continue.
 
     Returns {next_step, done_steps, remaining_steps, chapters_pending}.
-    next_step is None when every profile step is done.
+    next_step is None when every profile step is done. A registered
+    chapter (see CHAPTER_PLAN_EVENT) stays pending until its last looped
+    step is done — `set_step(..., chapter=)` records "step-<N>-done" per
+    step, and only step CHAPTER_LAST_STEP closes the chapter.
     """
     profile_steps = manifest.get("profile_steps", [])
     steps = manifest.get("steps", {})
     done = [s for s in profile_steps if steps.get(s, {}).get("status") in ("done", "skipped")]
     remaining = [s for s in profile_steps if s not in done]
+    chapter_done = ("done", f"step-{CHAPTER_LAST_STEP}-done")
     chapters_pending = [
         name
         for name, ch in manifest.get("chapters", {}).items()
-        if ch.get("status") not in ("done", None) and not str(ch.get("status", "")).endswith("-done")
+        if ch.get("status") not in chapter_done
     ]
     return {
         "next_step": remaining[0] if remaining else None,

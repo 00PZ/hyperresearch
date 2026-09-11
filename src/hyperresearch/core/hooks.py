@@ -3211,7 +3211,10 @@ prompt. No block = this prompt's defaults apply unchanged.
 - **corpus_tag**: vault tag for searching.
 - **comparisons_path**: `research/runs/<vault_tag>/comparisons.md`
 - **loci_path**: `research/runs/<vault_tag>/loci.json`
-- **output_path**: `research/runs/<vault_tag>/corpus-critic-gaps.json`
+- **output_path**: `research/runs/<vault_tag>/temp/corpus-critic-gaps-raw.json`.
+  Write ONLY here. The orchestrator owns
+  `research/runs/<vault_tag>/corpus-critic-gaps.json` — it merges its own
+  pre-flight gaps with yours into that file after you return.
 
 ## Procedure
 
@@ -3259,6 +3262,7 @@ prompt. No block = this prompt's defaults apply unchanged.
    {{
      "gaps": [
        {{
+         "id": "cc-1",
          "type": "overturning|strengthening|independent-verification",
          "target_position": "which claim/position this source would test",
          "search_queries": ["2-3 specific search queries to find this source"],
@@ -3272,7 +3276,8 @@ prompt. No block = this prompt's defaults apply unchanged.
 
    **Cap: << p.corpus_critic_gaps|hyphen >> gaps.** Only `critical` and `high` priority. Do not
    identify gaps for tangential topics — every gap must serve the
-   research_query.
+   research_query. Number `id` sequentially (`cc-1`, `cc-2`, ...) — the
+   orchestrator dispatches fetchers by `gap_id`.
 
 ## Rules
 
@@ -4125,6 +4130,36 @@ _HYPERRESEARCH_STEP_SKILLS = [
     "hyperresearch-15-polish",
     "hyperresearch-16-readability-audit",
 ]
+
+
+def _step_id_of_skill(skill_name: str) -> str:
+    """`hyperresearch-14-5-cite-check` -> "14.5"; `hyperresearch-2-width-sweep` -> "2".
+
+    The step id is the run of leading numeric segments after the
+    `hyperresearch-` prefix, joined with dots — the same key `hpr run step`
+    records in the manifest.
+    """
+    parts = skill_name.removeprefix("hyperresearch-").split("-")
+    digits: list[str] = []
+    for part in parts:
+        if not part.isdigit():
+            break
+        digits.append(part)
+    return ".".join(digits)
+
+
+# Step id -> installed skill slug, derived from the roster above so
+# `hpr run resume` can never suggest a skill the installer doesn't ship.
+STEP_SKILL_BY_ID: dict[str, str] = {
+    _step_id_of_skill(name): name for name in _HYPERRESEARCH_STEP_SKILLS
+}
+
+
+def step_skill_slug(step: str | None) -> str | None:
+    """The installed skill slug for a manifest step id, or None if unknown."""
+    if step is None:
+        return None
+    return STEP_SKILL_BY_ID.get(str(step))
 
 
 def _install_hyperresearch_step_skills(vault_root: Path) -> str | None:

@@ -168,15 +168,18 @@ class TestBuiltins:
 
     def test_char_targets_track_word_targets_per_gear(self):
         """`char_targets_no_word_boundary` is authored per gear alongside
-        `word_targets` (3 chars per word, the ratio the CJK ship gate falls
-        back to). premier/dissertation used to inherit full's character
+        `word_targets` at `chars_per_word_no_word_boundary` chars per word
+        (the ratio the CJK ship gate falls back to and the density gate
+        divides by). premier/dissertation used to inherit full's character
         targets while overriding word targets, so their CJK length gate
         measured against another gear's numbers (#101)."""
         for name in BUILTIN_PROFILES:
             p = resolve_profile(name)
+            ratio = p.chars_per_word_no_word_boundary
             assert set(p.char_targets_no_word_boundary) == set(p.word_targets), name
             for fmt, (low_w, high_w) in p.word_targets.items():
-                assert p.char_targets_no_word_boundary[fmt] == (low_w * 3, high_w * 3), (name, fmt)
+                expected = (int(low_w * ratio), int(high_w * ratio))
+                assert p.char_targets_no_word_boundary[fmt] == expected, (name, fmt)
 
 
 class TestUserOverlay:

@@ -98,6 +98,12 @@ Deliberate deviations already folded into the goldens (2026-07-19):
     citation totals + floor, the draft orchestrator's word targets, and
     the width-sweep utility-scoring gate + vault-check interval all render
     from the profile — byte-identical under `full`.
+  - Script-neutral citation density (2026-09-11, #76): the instruction
+    critic's R2 (and the synthesizer, not golden-covered) count words —
+    characters / `p.chars_per_word_no_word_boundary` for scripts without
+    word boundaries — against `p.citation_density_min` per 1000 WORDS (9,
+    the old 1.5-per-1000-characters floor expressed in English words)
+    instead of per 1000 characters.
 """
 
 from __future__ import annotations
@@ -230,7 +236,8 @@ def test_premier_gear_agents_carry_premier_numbers():
     assert "which of the 3 parallel" in loci
     assert "clamp\nto 10 loci" in loci
     critic = render_prompt(hooks.INSTRUCTION_CRITIC_AGENT, ctx)
-    assert "**1.5 citations per 1000\ncharacters**" in critic
+    assert "**9 citations per 1000 words**" in critic
+    assert "divide by 3)" in critic
     for prompt in (draft, synth, loci, critic):
         assert "<<" not in prompt and ">>" not in prompt
 

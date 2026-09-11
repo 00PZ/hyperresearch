@@ -43,6 +43,16 @@ def _lacks_word_boundaries(text: str) -> bool:
     return avg_token_chars >= _NO_WORD_BOUNDARY_AVG_TOKEN_CHARS
 
 
+def _effective_word_count(text: str, chars_per_word: float) -> float:
+    """Script-neutral word count: `str.split()` where whitespace delimits
+    words, else characters / `chars_per_word` (the profile's ratio for
+    scripts like Chinese, Japanese or Thai). Korean is space-delimited and
+    takes the split path."""
+    if _lacks_word_boundaries(text):
+        return len(text) / chars_per_word
+    return len(text.split())
+
+
 EVENTS_NAME = "events.jsonl"
 
 RUN_STATUSES = ("running", "paused", "blocked", "done", "failed", "aborted")
@@ -460,14 +470,15 @@ def verify_run(vault, vault_tag: str) -> dict:
         if response_format and response_format in profile.word_targets:
             if _lacks_word_boundaries(report_text):
                 # char_targets_no_word_boundary is profile-configurable per
-                # response_format; falls back to word_target * 3 (a CJK-shaped
-                # guess) if a format has no explicit target.
-                char_targets = getattr(profile, "char_targets_no_word_boundary", None) or {}
+                # response_format; falls back to word_target * chars_per_word
+                # if a format has no explicit target.
+                char_targets = profile.char_targets_no_word_boundary
                 if response_format in char_targets:
                     low, high = char_targets[response_format]
                 else:
                     low_w, high_w = profile.word_targets[response_format]
-                    low, high = low_w * 3, high_w * 3
+                    ratio = profile.chars_per_word_no_word_boundary
+                    low, high = int(low_w * ratio), int(high_w * ratio)
                 count = len(report_text)
                 check(
                     "length-in-range",
@@ -492,18 +503,35 @@ def verify_run(vault, vault_tag: str) -> dict:
 
         import re as _re
 
+        from hyperresearch.core.patterns import WIKI_LINK_RE
+
         # Grouped markers ([7, 12]) count one citation per source number,
-        # so consolidating stacks never lowers measured density.
+        # so consolidating stacks never lowers measured density. Wiki-link
+        # citations use the shared pattern so this gate and the lint/cite-
+        # check rules agree on what a [[...]] citation is.
         cites = sum(
             len(g.split(","))
             for g in _re.findall(r"\[(\d{1,3}(?:\s*,\s*\d{1,3})*)\]", report_text)
-        ) + len(_re.findall(r"\[\[[^\]]+\]\]", report_text))
-        density = cites / max(1, len(report_text)) * 1000
+        ) + len(WIKI_LINK_RE.findall(report_text))
+        # Per 1000 *effective* words, not characters: a character floor
+        # means a different amount of content per script (CJK packs ~3x
+        # the content per character), so the same number would be a
+        # different bar for a Japanese report than for an English one.
+        no_boundaries = _lacks_word_boundaries(report_text)
+        effective_words = _effective_word_count(
+            report_text, profile.chars_per_word_no_word_boundary
+        )
+        density = cites * 1000 / max(1.0, effective_words)
         floor = profile.citation_density_min  # also the instruction critic's re-count trigger
+        unit = (
+            f"words (chars / {profile.chars_per_word_no_word_boundary:g}; no word boundaries)"
+            if no_boundaries
+            else "words"
+        )
         check(
             "citation-density",
             density >= floor,
-            f"{density:.2f} citations/1000 chars (floor {floor})",
+            f"{density:.2f} citations/1000 {unit} (floor {floor})",
         )
 
         check(

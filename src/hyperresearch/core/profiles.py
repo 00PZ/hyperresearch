@@ -148,9 +148,19 @@ class Profile(BaseModel):
     # override this per profile in .hyperresearch/config.toml, the same way
     # they'd override word_targets or any other tunable.
     char_targets_no_word_boundary: dict[str, Range] = Field(default_factory=dict)
+    # Characters that stand in for one word when the script has no word
+    # boundaries. The built-in char_targets_no_word_boundary are word_targets
+    # times this; the CJK length gate falls back to it for a format with no
+    # explicit char target; and the citation-density gate divides character
+    # counts by it so "per 1000 words" means the same amount of content in
+    # every script.
+    chars_per_word_no_word_boundary: float = 3.0
     # Ship-gate floor for `run verify`'s citation-density check, and the
     # re-count trigger the instruction critic and synthesizer are told to
-    # apply: cited-source references per 1000 body characters.
+    # apply: cited-source references per 1000 words. For scripts without
+    # word boundaries the word count is characters / chars_per_word_no_word_boundary,
+    # so the floor is script-neutral — the same references per unit of
+    # content whether the report is English or Japanese.
     citation_density_min: float
     citation_totals: dict[str, Range]
 
@@ -241,9 +251,12 @@ _FULL: dict = {
     "must_read": {"argumentative": (35, 50), "structured": (25, 40), "short": (20, 30)},
     "word_targets": {"short": (500, 2000), "structured": (2000, 5000), "argumentative": (5000, 10000)},
     "char_targets_no_word_boundary": {"short": (1500, 6000), "structured": (6000, 15000), "argumentative": (15000, 30000)},
-    # The ship gate's floor (was a `1.5` literal in runs.py and two agent
-    # prompts while this field sat unread at 2.0).
-    "citation_density_min": 1.5,
+    "chars_per_word_no_word_boundary": 3.0,
+    # 9 per 1000 words is the old 1.5-per-1000-characters floor expressed in
+    # words for English prose (~6 characters per word including the space),
+    # so English verdicts are unchanged; CJK reports are now held to the
+    # same floor per unit of content instead of a ~2x looser one.
+    "citation_density_min": 9.0,
     "citation_totals": {"argumentative": (80, 150), "structured": (40, 80), "short": (15, 30)},
     "critic_finding_caps": {"dialectic": 12, "depth": 12, "width": 10, "instruction": 15},
     "gap_fetch_cap": 5,

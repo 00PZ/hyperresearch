@@ -13,7 +13,15 @@ import re
 # the `links` table, and `repair` / `graph stub` mint a stub note for it. A
 # real wiki-link is never immediately followed by `(`; a parenthetical
 # after a space (`[[note]] (2024)`) still matches (issue #93).
-WIKI_LINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\](?!\()")
+#
+# Neither character class admits `[`. Page bodies are attacker-controlled
+# and this runs on every sync: with `[` allowed, a line of N `[` characters
+# made every `[[` start position eat to the end of the run before failing —
+# quadratic, ~20 s at 40 KB and unbounded at 1 MB. Excluding `[` makes a
+# candidate fail at its first extra bracket, so scanning is linear. A target
+# with an interior `[` (`[[t.IO[t.Any]]`) was already rejected downstream by
+# is_valid_wiki_link_target's bracket-balance check; now it never matches.
+WIKI_LINK_RE = re.compile(r"\[\[([^\]\[|]+)(?:\|[^\]\[]+)?\]\](?!\()")
 
 # Code block patterns for stripping before link extraction
 CODE_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)

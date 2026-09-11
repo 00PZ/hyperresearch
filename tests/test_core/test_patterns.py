@@ -188,3 +188,48 @@ def test_unbalanced_brackets_rejected():
     assert not is_valid_wiki_link_target("foo]")
     # Balanced brackets inside an id are unusual but not a parse artifact.
     assert is_valid_wiki_link_target("array[0]-semantics")
+
+
+def test_wikilink_scan_is_linear_on_bracket_floods():
+    # Page bodies are attacker-controlled and this pattern runs on every
+    # sync. With `[` admitted into the character classes every `[[` start
+    # position ate to the end of the run before failing: ~20 s at 40 KB,
+    # unbounded at 1 MB. Each flood below must finish in well under a second.
+    import time
+
+    floods = {
+        "[": "[" * 300_000,
+        "[[": "[[" * 150_000,
+        "[[a": "[[a" * 100_000,
+        "[[a|": "[[a|" * 75_000,
+        "[[a|b": "[[a|b" * 60_000,
+        "]](": "[[a]](" * 50_000,
+    }
+    for name, flood in floods.items():
+        started = time.perf_counter()
+        targets = _targets(flood)
+        elapsed = time.perf_counter() - started
+        assert elapsed < 1.0, f"{name!r} flood took {elapsed:.2f}s"
+        assert targets == [], name
+
+
+def test_template_placeholder_check_is_linear():
+    import time
+
+    # Only the time is under test: an unclosed brace flood is not a
+    # placeholder, so the verdict itself may legitimately be True.
+    for flood in ("{" * 300_000, "{" + "a" * 300_000, "{a" * 150_000, "{a}" * 100_000):
+        started = time.perf_counter()
+        is_valid_wiki_link_target(flood)
+        assert time.perf_counter() - started < 1.0
+
+
+def test_interior_open_bracket_never_matches():
+    # Previously matched as target `t.IO[t.Any` and was rejected downstream
+    # by the bracket-balance check; now the pattern itself refuses it.
+    assert _targets("[[t.IO[t.Any]]") == []
+    assert _targets("[[list[str]]") == []
+    # Extra leading brackets do not become part of the target.
+    assert _targets("[[[x]]") == ["x"]
+    # Ordinary links and aliases are untouched.
+    assert _targets("[[note-id]] and [[other|Shown]]") == ["note-id", "other"]

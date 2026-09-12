@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- **A run tag is a slug (#116).** `Vault.run_dir()` joined the tag onto `research/runs/` unchecked, and pathlib replaces the base on an absolute segment, so `hpr run init ../../x` or `hpr run init C:/anything` scaffolded a run workspace outside the vault and every later `run` subcommand followed it there. Tags are now validated at that one seam: letters, digits, `-`, `_` and `.`, starting with a letter or digit, which is what `hpr vault-tag` mints. `run`, `levers` and `citecheck` report a bad tag as a clean error instead of a traceback. Same bug class as the `claims ingest --tag` traversal fixed in 0.11.1; exposure is low because the tag comes from the operator or the orchestrating agent, not from fetched content.
+
 ## [0.11.1] - 2026-09-11
 
 ### Seven fixes from the backlog sweep

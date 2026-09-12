@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- **The builtin provider fetches PDFs (#82, reported by @earldodd).** The PDF lane (`_is_pdf_url` / `_fetch_pdf`) lived inside the crawl4ai provider only, so a vault still on `provider = "builtin"` (the default until `hpr install` switches it) had no PDF handling at all: a direct `.pdf` link was decoded as HTML text and rejected by the junk gate as "Binary PDF garbage in content", identically for every mirror of the same document, and an arXiv `/abs/` link saved the 900-word abstract page instead of the paper. The lane now lives in `web/pdf.py` and both providers use it; the crawl4ai module keeps the old names. The builtin provider also detects a PDF from its bytes when the URL does not look like one. When the PDF lane declines a URL and the HTML fallback turns out to be junk, `hpr fetch -j` now says why the lane declined it (`PDF lane: HTTP 403`, `no extractable text layer`, ...) instead of the generic junk verdict, and the pymupdf document handle is closed on the exception path instead of leaking one per encrypted PDF.
+
 ## [0.11.1] - 2026-09-11
 
 ### Seven fixes from the backlog sweep

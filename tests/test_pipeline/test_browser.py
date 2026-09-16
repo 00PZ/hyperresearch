@@ -1,16 +1,15 @@
-"""Claude-in-Chrome must not silent-skip."""
+"""Claude-in-Chrome is skipped; research continues."""
 
 from __future__ import annotations
 
-import pytest
-
+from hyperresearch.core.escalation import enqueue, queue_stats
 from hyperresearch.pipeline.orchestrator import _assert_no_chrome
-from hyperresearch.runtime.errors import BrowserUnsupported
 
 
-def test_queued_escalation_is_unsupported(tmp_vault):
-    from hyperresearch.core.escalation import enqueue
-
+def test_queued_escalation_is_abandoned_not_crash(tmp_vault):
     enqueue(tmp_vault.db, "https://example.com", "login_wall", vault_tag="run-1")
-    with pytest.raises(BrowserUnsupported, match="unsupported"):
-        _assert_no_chrome(tmp_vault, "run-1")
+    _assert_no_chrome(tmp_vault, "run-1")
+    stats = queue_stats(tmp_vault.db, vault_tag="run-1")
+    assert stats["queued"] == 0
+    assert stats["needs_human"] == 0
+    assert stats["abandoned"] >= 1

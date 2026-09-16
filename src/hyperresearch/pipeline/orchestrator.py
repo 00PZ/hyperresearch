@@ -514,17 +514,32 @@ def _maybe_patches(result: AgentResult, current_hash: str) -> PatchSet | None:
 
 
 def _assert_no_chrome(vault: Vault, tag: str) -> None:
+    """Claude-in-Chrome is unsupported. Abandon queued items; do not crash or block."""
     try:
-        from hyperresearch.core.escalation import queue_stats
+        from hyperresearch.core.escalation import list_items, queue_stats, resolve
 
         stats = queue_stats(vault.db, vault_tag=tag)
     except Exception:
         return
-    if stats and (stats.get("queued") or stats.get("needs_human")):
-        raise BrowserUnsupported(
-            "Claude-in-Chrome browser escalation is unsupported in Spec 1; "
-            "queued escalations are not silent-skipped"
-        )
+    if not stats or not (
+        stats.get("queued") or stats.get("needs_human") or stats.get("in_progress")
+    ):
+        return
+    for status in ("queued", "in_progress", "needs_human"):
+        try:
+            items = list_items(vault.db, status=status, vault_tag=tag)
+        except Exception:
+            continue
+        for item in items:
+            try:
+                resolve(
+                    vault.db,
+                    int(item["id"]),
+                    "abandoned",
+                    detail="Spec 1: Claude-in-Chrome unsupported; skip fetch, continue run",
+                )
+            except Exception:
+                continue
 
 
 def _write_report(path: Path, text: str) -> None:

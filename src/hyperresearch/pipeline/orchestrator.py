@@ -27,6 +27,7 @@ from hyperresearch.pipeline.host_actions import (
     run_host_action_loop,
 )
 from hyperresearch.pipeline.patch import PatchOp, PatchSet, apply_patch_set, content_hash
+from hyperresearch.pipeline.prompts import evidence_extra, report_extra, role_payload
 from hyperresearch.runtime.errors import BrowserUnsupported
 from hyperresearch.runtime.types import (
     AgentResult,
@@ -53,6 +54,15 @@ def mint_run_tag(query: str) -> str:
 
 def report_path(vault: Vault, tag: str) -> Path:
     return vault.root / "research" / "notes" / f"final_report_{tag}.md"
+
+
+def _payload(role: str, context: ResearchContext, extra: str = "") -> str:
+    return role_payload(
+        role,
+        context.canonical_query,
+        extra=extra,
+        declared_tier=context.tier,
+    )
 
 
 def task_log_for(vault: Vault, tag: str) -> TaskLog:
@@ -273,7 +283,7 @@ async def _run_cite_check(
         AgentTask(
             task_id=task_id,
             role="cite_checker",
-            payload=context.canonical_query,
+            payload=_payload("cite_checker", context),
             model=model,
             allowed_actions=(),
         ),
@@ -346,7 +356,7 @@ async def execute_step(
             AgentTask(
                 task_id="step-1",
                 role="decompose",
-                payload=context.canonical_query,
+                payload=_payload("decompose", context),
                 model=model,
                 output_schema=dict,
                 allowed_actions=(),
@@ -367,7 +377,7 @@ async def execute_step(
             AgentTask(
                 task_id=f"step-{step}",
                 role=role,
-                payload=context.canonical_query,
+                payload=_payload(role, context),
                 model=model,
                 output_schema=dict,
                 allowed_actions=allowed,
@@ -387,7 +397,14 @@ async def execute_step(
             AgentTask(
                 task_id=f"step-{step}",
                 role=role,
-                payload=context.canonical_query,
+                payload=_payload(
+                    role,
+                    context,
+                    extra=evidence_extra(
+                        vault.notes_dir,
+                        vault.run_dir(tag) / "prompt-decomposition.json",
+                    ),
+                ),
                 model=model,
                 allowed_actions=(),
             ),
@@ -416,7 +433,7 @@ async def execute_step(
             AgentTask(
                 task_id=f"step-{step}",
                 role=role,
-                payload=context.canonical_query,
+                payload=_payload(role, context),
                 model=model,
                 allowed_actions=(),
             ),
@@ -451,7 +468,11 @@ async def execute_step(
             AgentTask(
                 task_id="step-14",
                 role="patcher",
-                payload=context.canonical_query,
+                payload=_payload(
+                    "patcher",
+                    context,
+                    extra=report_extra(current, content_hash(current)),
+                ),
                 model=model,
                 output_schema=dict,
                 allowed_actions=(),
@@ -481,7 +502,14 @@ async def execute_step(
             AgentTask(
                 task_id=f"step-{step}",
                 role=role,
-                payload=context.canonical_query,
+                payload=_payload(
+                    role,
+                    context,
+                    extra=report_extra(
+                        path.read_text(encoding="utf-8-sig") if path.exists() else "",
+                        before,
+                    ),
+                ),
                 model=model,
                 output_schema=dict,
                 allowed_actions=(),

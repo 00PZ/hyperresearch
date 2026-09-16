@@ -163,3 +163,39 @@ def test_path_traversal_rejected(tmp_vault):
             HostAction(kind="fetch", args={"url": "https://x"}, reason="x"),
             (),
         )
+
+
+def test_missing_actions_retries_then_complete(tmp_vault):
+    script = {
+        "loop-model-0": AgentResult(
+            text='{"report": "nope"}',
+            structured={"report": "nope"},
+            requested_model="m",
+        ),
+        "loop-model-1": AgentResult(
+            text="done",
+            structured={"kind": "complete", "args": {}, "reason": "ok"},
+            requested_model="m",
+        ),
+    }
+    rt = FakeRuntime(responses=script)
+    ex = HostExecutor(vault=tmp_vault, workspace_root=tmp_vault.root)
+    log = TaskLog(tmp_vault.run_dir("r-retry") / "task_log.jsonl")
+    tmp_vault.run_dir("r-retry").mkdir(parents=True, exist_ok=True)
+    result = run(run_host_action_loop(
+        rt,
+        AgentTask(
+            task_id="loop",
+            role="investigator",
+            payload="q",
+            model="m",
+            allowed_actions=("search", "fetch", "evidence_read", "complete"),
+        ),
+        _ctx(tmp_vault.root),
+        ex,
+        HostBudget(max_iterations=8, max_seconds=30, max_cost_usd=10),
+        log,
+        task_id_prefix="loop",
+    ))
+    assert result.text == "done"
+    assert any("No host actions parsed" in t.payload for t in rt.calls[1:])

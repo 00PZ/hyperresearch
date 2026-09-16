@@ -75,17 +75,50 @@ class HostExecutor:
         limit = max(1, min(limit, 50))
         if self.search_fn is not None:
             hits = self.search_fn(query, limit=limit)
-        else:
+            digest = hashlib.sha256(repr(hits).encode()).hexdigest()[:16]
+            return {
+                "task_id": task_id,
+                "kind": "search",
+                "ok": True,
+                "query": query,
+                "results": hits,
+                "content_hash": digest,
+            }
+        vault_hits: list[Any] = []
+        try:
             from hyperresearch.search.fts import search_fts
 
-            hits = search_fts(self.vault.db, query, limit=limit)
-        digest = hashlib.sha256(repr(hits).encode()).hexdigest()[:16]
+            vault_hits = list(search_fts(self.vault.db, query, limit=limit) or [])
+        except Exception as e:
+            vault_hits = [{"error": str(e)}]
+        web_hits: list[Any] = []
+        web_error: str | None = None
+        try:
+            from hyperresearch.pipeline.prompts import web_hit
+            from hyperresearch.web.base import get_provider
+
+            provider_name = getattr(getattr(self.vault, "config", None), "web_provider", None)
+            prov = get_provider(provider_name)
+            web_hits = [web_hit(item) for item in prov.search(query, max_results=limit)]
+        except NotImplementedError as e:
+            web_error = str(e)
+        except Exception as e:
+            web_error = str(e)
+        payload = {
+            "vault_hits": vault_hits,
+            "web_hits": web_hits,
+            "web_error": web_error,
+            "hint": None
+            if web_hits
+            else "Provider cannot web-search. Propose fetch actions with https URLs.",
+        }
+        digest = hashlib.sha256(repr(payload).encode()).hexdigest()[:16]
         return {
             "task_id": task_id,
             "kind": "search",
-            "ok": True,
+            "ok": bool(web_hits or vault_hits) or web_error is None,
             "query": query,
-            "results": hits,
+            "results": payload,
             "content_hash": digest,
         }
 
@@ -242,6 +275,14 @@ async def run_host_action_loop(
             log.succeed(model_id, {"text": last.text[:2000]})
         actions = iter_host_actions(last.structured)
         if not actions:
+            if any(k in task.allowed_actions for k in ("search", "fetch")):
+                payload = (
+                    payload
+                    + "\n\n<host-error>No host actions parsed. "
+                    + "Emit JSON {\"actions\":[{\"kind\":\"fetch\",\"args\":{\"url\":\"https://...\"},\"reason\":\"...\"}]} "
+                    + "or kind complete after fetching.</host-error>\n"
+                )
+                continue
             break
         provenance: list[dict[str, Any]] = []
         stop = False

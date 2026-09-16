@@ -38,7 +38,7 @@ from hyperresearch.pipeline.prompts import (
     report_extra,
     role_payload,
 )
-from hyperresearch.runtime.errors import BrowserUnsupported
+from hyperresearch.runtime.errors import BrowserUnsupported, RuntimeTimeout
 from hyperresearch.runtime.types import (
     AgentResult,
     AgentRuntime,
@@ -160,7 +160,7 @@ async def run_many_retry(
     log: TaskLog,
     ledger: SpendLedger | None = None,
 ) -> list[AgentResult]:
-    """Retry only failed members. Successful siblings are not launched again."""
+    """Retry only known-safe failed members. Do not auto-POST uncertain transport."""
     results: dict[str, AgentResult] = {}
     pending = [t for t in tasks if not log.is_success(t.task_id)]
     for t in tasks:
@@ -169,6 +169,7 @@ async def run_many_retry(
 
     sem = asyncio.Semaphore(max(1, concurrency))
     failed: list[AgentTask] = []
+    uncertain: list[str] = []
 
     async def one(t: AgentTask) -> None:
         decision = log.resume_model(t.task_id)
@@ -184,7 +185,15 @@ async def run_many_retry(
             log.begin(t.task_id, "model", {"role": t.role})
             try:
                 r = await runtime.run(t, context)
+            except RuntimeTimeout:
+                if ledger is not None:
+                    ledger.release()
+                log.mark_uncertain_remote(t.task_id)
+                uncertain.append(t.task_id)
+                return
             except Exception:
+                if ledger is not None:
+                    ledger.release()
                 log.fail(t.task_id, "run failed")
                 failed.append(t)
                 return
@@ -194,6 +203,8 @@ async def run_many_retry(
             results[t.task_id] = r
 
     await asyncio.gather(*[one(t) for t in pending])
+    if uncertain:
+        raise RuntimeError(f"uncertain_remote:{uncertain[0]}")
     for t in list(failed):
         decision = log.resume_model(t.task_id)
         if decision == UNCERTAIN_REMOTE:
@@ -202,7 +213,17 @@ async def run_many_retry(
             ledger.block()
             raise BudgetExhaustedError(t.task_id)
         log.begin(t.task_id, "model", {"role": t.role, "retry": True})
-        r = await runtime.run(t, context)
+        try:
+            r = await runtime.run(t, context)
+        except RuntimeTimeout:
+            if ledger is not None:
+                ledger.release()
+            log.mark_uncertain_remote(t.task_id)
+            raise RuntimeError(f"uncertain_remote:{t.task_id}") from None
+        except Exception:
+            if ledger is not None:
+                ledger.release()
+            raise
         if ledger is not None:
             ledger.settle(r)
         log.succeed(t.task_id, dump_agent_result(r))
@@ -224,6 +245,27 @@ def _evidence_hash(vault: Vault, tag: str) -> str:
     return evidence_content_hash(vault, tag)
 
 
+_CITE_VERDICTS = frozenset({"unsupported", "partially-supported", "wrong-source"})
+_CITE_SEVERITIES = frozenset({"critical", "major"})
+
+
+def _cite_finding_valid(item: Any) -> str | None:
+    if not isinstance(item, dict):
+        return "MalformedStructuredOutput"
+    source = item.get("cited_note_id") or item.get("source")
+    if item.get("verdict") not in _CITE_VERDICTS:
+        return "invalid-finding"
+    if item.get("severity") not in _CITE_SEVERITIES:
+        return "invalid-finding"
+    if not isinstance(item.get("sentence"), str) or not str(item.get("sentence") or "").strip():
+        return "invalid-finding"
+    if not isinstance(item.get("evidence"), str) or not str(item.get("evidence") or "").strip():
+        return "invalid-finding"
+    if not isinstance(source, str) or not source.strip():
+        return "invalid-finding"
+    return None
+
+
 def _parse_cite_output(raw: str) -> tuple[dict[str, Any], bool]:
     if not raw or not raw.strip():
         return {"findings": [], "error": "empty"}, False
@@ -232,10 +274,19 @@ def _parse_cite_output(raw: str) -> tuple[dict[str, Any], bool]:
     except json.JSONDecodeError:
         return {"findings": [], "error": "malformed"}, False
     if isinstance(parsed, list):
-        return {"findings": parsed}, True
-    if isinstance(parsed, dict) and isinstance(parsed.get("findings"), list):
-        return dict(parsed), True
-    return {"findings": [], "error": "malformed"}, False
+        findings: list[Any] = parsed
+        data: dict[str, Any] = {"findings": findings}
+    elif isinstance(parsed, dict) and isinstance(parsed.get("findings"), list):
+        findings = parsed["findings"]
+        data = dict(parsed)
+    else:
+        return {"findings": [], "error": "malformed"}, False
+    for item in findings:
+        err = _cite_finding_valid(item)
+        if err is not None:
+            data["error"] = err
+            return data, False
+    return data, True
 
 
 def _write_cite_findings(
@@ -282,6 +333,7 @@ def _write_independence(vault: Vault, tag: str, summary: dict[str, Any]) -> None
         "evidence_hash": _evidence_hash(vault, tag),
         "scored": summary.get("scored", 0),
         "clusters": list(summary.get("clusters") or []),
+        "audited": list(summary.get("audited") or []),
     }
     (vault.run_dir(tag) / INDEPENDENCE_ARTIFACT).write_text(
         json.dumps(data, indent=2) + "\n", encoding="utf-8"
@@ -314,7 +366,8 @@ def _independence_bound(vault: Vault, tag: str) -> bool:
     evidence_ids.discard("")
     if not cited <= evidence_ids:
         return False
-    return int(data.get("scored") or 0) > 0
+    audited = {str(x) for x in (data.get("audited") or [])}
+    return cited <= audited
 
 
 def _block_ship(
@@ -349,7 +402,17 @@ async def _model(
         ledger.block()
         raise BudgetExhaustedError(task.task_id)
     log.begin(task.task_id, "model", {"role": task.role})
-    result = await runtime.run(task, context)
+    try:
+        result = await runtime.run(task, context)
+    except RuntimeTimeout:
+        if ledger is not None:
+            ledger.release()
+        log.mark_uncertain_remote(task.task_id)
+        raise RuntimeError(f"uncertain_remote:{task.task_id}") from None
+    except Exception:
+        if ledger is not None:
+            ledger.release()
+        raise
     if ledger is not None:
         ledger.settle(result)
     log.succeed(task.task_id, dump_agent_result(result))
@@ -504,7 +567,29 @@ async def execute_step(
         _assert_no_chrome(vault, tag)
         allowed = _INVESTIGATE
         role = {"2": "width", "5": "investigator", "8": "corpus_critic", "13": "gap_fetch"}[step]
-        extra = _evidence_blob(vault, tag)
+        parts = [_evidence_blob(vault, tag)]
+        if step == "5":
+            parts.append(inline_artifacts([("loci", run_dir / "loci.json")]))
+        elif step == "8":
+            parts.append(
+                inline_artifacts(
+                    [
+                        ("loci", run_dir / "loci.json"),
+                        ("comparisons", run_dir / "comparisons.md"),
+                        ("source-tensions", run_dir / "source-tensions.json"),
+                    ]
+                )
+            )
+        elif step == "13":
+            parts.append(
+                inline_artifacts(
+                    [
+                        (f"critic-findings-{name}.json", run_dir / f"critic-findings-{name}.json")
+                        for name in CRITIC_NAMES
+                    ]
+                )
+            )
+        extra = "\n".join(parts)
         await run_host_action_loop(
             runtime,
             AgentTask(
@@ -523,7 +608,15 @@ async def execute_step(
             ledger=ledger,
         )
     elif step == "10":
-        extra = _evidence_blob(vault, tag)
+        extra = _evidence_blob(vault, tag) + "\n" + inline_artifacts(
+            [
+                ("evidence-digest", run_dir / EVIDENCE_DIGEST),
+                ("contradiction-graph", run_dir / "contradiction-graph.md"),
+                ("loci", run_dir / "loci.json"),
+                ("comparisons", run_dir / "comparisons.md"),
+                ("source-tensions", run_dir / "source-tensions.json"),
+            ]
+        )
         if context.tier == "light" or (profile is not None and profile.draft_count <= 1):
             result = await _model(
                 runtime,
@@ -775,7 +868,9 @@ def _ship(vault: Vault, tag: str, tier: str) -> dict[str, Any]:
     try:
         from hyperresearch.core.independence import compute_independence
 
-        summary = compute_independence(vault, tag)
+        ids = [str(s.get("note_id") or "") for s in load_evidence(vault, tag)]
+        ids = [i for i in ids if i]
+        summary = compute_independence(vault, note_ids=ids)
         path = vault.run_dir(tag) / INDEPENDENCE_ARTIFACT
         if not path.exists():
             _write_independence(vault, tag, summary)

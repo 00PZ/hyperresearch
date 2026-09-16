@@ -5,9 +5,16 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from hyperresearch.pipeline.checkpoints import UNCERTAIN_REMOTE, TaskLog, dump_agent_result
 from hyperresearch.pipeline.host_actions import HostBudget, HostExecutor, run_host_action_loop
-from hyperresearch.pipeline.orchestrator import _maybe_patches, run_many_retry
+from hyperresearch.pipeline.orchestrator import (
+    _maybe_patches,
+    execute_run,
+    run_many_retry,
+    task_log_for,
+)
 from hyperresearch.pipeline.patch import PatchState, apply_patch_set, content_hash
 from hyperresearch.runtime import (
     AgentResult,
@@ -15,7 +22,9 @@ from hyperresearch.runtime import (
     FakeRuntime,
     ResearchContext,
     RuntimeFailure,
+    RuntimeTimeout,
 )
+from tests.test_pipeline.test_full import _rt, plant_src, run
 
 
 def _ctx(tmp_path: Path) -> ResearchContext:
@@ -92,6 +101,44 @@ def test_run_many_skip_already_successful(tmp_path):
     assert results[1].text == "fresh"
     assert "a" not in calls
     assert calls == ["b"]
+
+
+def test_run_many_timeout_does_not_retry_task_id(tmp_path):
+    calls: list[str] = []
+
+    class Boom(FakeRuntime):
+        async def run(self, task, context):
+            calls.append(task.task_id)
+            if task.task_id == "b":
+                raise RuntimeTimeout("t")
+            return await super().run(task, context)
+
+    rt = Boom()
+    rt.default = "ok"
+    log = TaskLog(tmp_path / "t.jsonl")
+    with pytest.raises(RuntimeError, match="uncertain_remote:b"):
+        asyncio.run(run_many_retry(rt, [_task("a"), _task("b"), _task("c")], _ctx(tmp_path), 3, log))
+    assert calls.count("b") == 1
+    assert calls.count("a") == 1
+    assert calls.count("c") == 1
+    assert log.get("b") is not None
+    assert log.get("b").status == UNCERTAIN_REMOTE
+    assert log.is_success("a")
+    assert log.is_success("c")
+
+
+def test_critic_timeout_one_dispatch_uncertain_remote(tmp_vault):
+    plant_src(tmp_vault, "to-crit")
+    rt = _rt(critic_depth=RuntimeTimeout("t"))
+    with pytest.raises(RuntimeError, match="uncertain_remote"):
+        run(execute_run(tmp_vault, "What is X?", rt, profile="full", tag="to-crit"))
+    depth = [c for c in rt.calls if c.role == "critic_depth"]
+    assert len(depth) == 1
+    log = task_log_for(tmp_vault, "to-crit")
+    rec = log.get("step-12-depth")
+    assert rec is not None
+    assert rec.status == UNCERTAIN_REMOTE
+    assert log.is_success("step-12-dialectic")
 
 
 def test_crash_between_model_success_and_first_action_still_fetches(tmp_vault):

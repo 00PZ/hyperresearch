@@ -635,11 +635,22 @@ def verify_run(vault, vault_tag: str) -> dict:
                 # (and the original design sketch) used a bare list. Accept both.
                 if isinstance(findings, dict):
                     findings = findings.get("findings", [])
-                criticals = [f for f in findings if f.get("severity") == "critical"]
-                if criticals:
-                    log_path = run_dir / "cite-check-patch-log.json"
-                    ok = log_path.exists()
-                    detail = f"{len(criticals)} critical finding(s); patch log {'present' if ok else 'MISSING'}"
+                if not isinstance(findings, list):
+                    ok = False
+                    detail = "cite-check findings is not a list"
+                else:
+                    criticals = [
+                        f
+                        for f in findings
+                        if isinstance(f, dict) and f.get("severity") == "critical"
+                    ]
+                    if criticals:
+                        log_path = run_dir / "cite-check-patch-log.json"
+                        ok = log_path.exists()
+                        detail = (
+                            f"{len(criticals)} critical finding(s); patch log "
+                            f"{'present' if ok else 'MISSING'}"
+                        )
             except json.JSONDecodeError:
                 ok = False
                 detail = "cite-check-findings.json is not valid JSON"

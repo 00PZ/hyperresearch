@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import pytest
+
 from hyperresearch.core.runs import load_manifest
 from hyperresearch.pipeline.orchestrator import execute_run, resume_run
-from hyperresearch.runtime import FakeRuntime
+from hyperresearch.runtime import AgentResult, FakeRuntime
 from tests.test_pipeline.test_full import _rt, plant_src, run
 
 
@@ -85,3 +87,37 @@ def test_exhaustion_cannot_produce_verified(tmp_vault):
     assert result["manifest"]["status"] == "blocked"
     assert result["manifest"]["status"] != "verified"
     assert result["manifest"]["status"] != "completed"
+
+
+def test_low_actual_cost_settlement_keeps_remaining_usable(tmp_vault):
+    plant_src(tmp_vault, "bud-frac")
+
+    class Cheap(FakeRuntime):
+        async def run(self, task, context):
+            r = await super().run(task, context)
+            return AgentResult(
+                text=r.text,
+                structured=r.structured,
+                usage={"cost_usd": 0.01},
+                requested_model=r.requested_model,
+                reported_model=r.reported_model,
+                runtime_metadata=dict(r.runtime_metadata),
+            )
+
+    rt = Cheap(responses=_rt().responses)
+    result = run(
+        execute_run(
+            tmp_vault,
+            "What is X?",
+            rt,
+            profile="full",
+            tag="bud-frac",
+            budget_usd=1,
+        )
+    )
+    assert len(rt.calls) > 1
+    spent = result["manifest"]["spend"]["estimated_usd"]
+    assert spent == pytest.approx(0.01 * len(rt.calls), abs=0.0001)
+    assert spent < 1
+    assert result["manifest"]["status"] == "verified"
+    assert result["manifest"]["blocked_on"] is None

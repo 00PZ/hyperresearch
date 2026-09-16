@@ -99,9 +99,12 @@ _CRITIC_ROLES = {
 _ROLE_HINTS = {
     "contradiction": "Build an explicit graph of opposing claims across the evidence. Rank contested fights. Identify consensus.",
     "loci": "From the contradiction graph, name the load-bearing loci (forks in the evidence) as JSON.",
+    "investigator": "Investigate the load-bearing loci below. Propose host actions to fetch or read evidence for each locus.",
     "reconcile": "Reconcile cross-locus tensions using the loci and evidence. Write comparisons.",
     "tensions": "Extract expert disagreements as JSON from comparisons and evidence.",
+    "corpus_critic": "Critique corpus coverage against loci, comparisons, and tensions. Fetch missing clusters.",
     "digest": "Write an evidence digest: load-bearing claims with verbatim quotes and source note ids.",
+    "gap_fetch": "Fetch sources that address the critic findings below. Do not rewrite the report.",
 }
 
 

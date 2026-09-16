@@ -59,11 +59,12 @@ def budget_from_profile(profile: Profile, manifest: dict[str, Any]) -> HostBudge
 
 @dataclass
 class SpendLedger:
-    """Durable run-wide spend. Resume restores from the manifest."""
+    """Durable settled spend. Pending reservations are in-memory only."""
 
     vault: Vault
     tag: str
     default_call_cost: float = DEFAULT_CALL_COST_USD
+    pending: float = 0.0
 
     def spent(self) -> float:
         manifest = load_manifest(self.vault, self.tag)
@@ -77,21 +78,23 @@ class SpendLedger:
         ceil = self.ceiling()
         if ceil is None:
             return True
-        return self.spent() < ceil
+        return self.spent() + self.pending < ceil
 
     def reserve(self) -> bool:
         if not self.can_dispatch():
             return False
-        add_spend(self.vault, self.tag, estimated_usd=self.default_call_cost, agents_spawned=1)
+        self.pending = round(self.pending + self.default_call_cost, 4)
         return True
+
+    def release(self) -> None:
+        self.pending = max(0.0, round(self.pending - self.default_call_cost, 4))
 
     def settle(self, result: AgentResult) -> None:
         actual = _cost_of(result)
         if actual <= 0:
             actual = self.default_call_cost
-        delta = actual - self.default_call_cost
-        if delta:
-            add_spend(self.vault, self.tag, estimated_usd=delta)
+        self.release()
+        add_spend(self.vault, self.tag, estimated_usd=actual, agents_spawned=1)
 
     def block(self) -> None:
         set_status(self.vault, self.tag, "blocked", blocked_on="budget")
@@ -416,7 +419,12 @@ async def run_host_action_loop(
                 output_schema=task.output_schema,
                 allowed_actions=task.allowed_actions,
             )
-            last = await runtime.run(step_task, context)
+            try:
+                last = await runtime.run(step_task, context)
+            except Exception:
+                if ledger is not None:
+                    ledger.release()
+                raise
             spent_local += _cost_of(last) or (ledger.default_call_cost if ledger else 0.0)
             if ledger is not None:
                 ledger.settle(last)

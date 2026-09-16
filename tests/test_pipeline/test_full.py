@@ -173,3 +173,34 @@ def test_stale_independence_evidence_hash_is_not_verified(tmp_vault):
     manifest = load_manifest(tmp_vault, "fl-ind-stale")
     assert manifest["status"] == "blocked"
     assert manifest["status"] != "verified"
+
+
+def test_investigator_payload_contains_loci_marker(tmp_vault):
+    marker = "LOCI_MARKER_ZX91"
+    plant_src(tmp_vault, "pay-loci")
+    rt = _rt(loci=json.dumps({"loci": [{"id": marker}]}))
+    run(execute_run(tmp_vault, "What is X?", rt, profile="full", tag="pay-loci"))
+    inv = [c for c in rt.calls if c.role == "investigator"]
+    assert inv
+    assert marker in inv[0].payload
+
+
+def test_gap_fetch_payload_contains_critic_finding_marker(tmp_vault):
+    marker = "CRITIC_MARKER_QW17"
+    plant_src(tmp_vault, "pay-gap")
+    finding = json.dumps({"findings": [{"severity": "major", "issue": marker, "suggestion": "fix"}]})
+    rt = _rt(critic_dialectic=finding)
+    run(execute_run(tmp_vault, "What is X?", rt, profile="full", tag="pay-gap"))
+    gap = [c for c in rt.calls if c.role == "gap_fetch"]
+    assert gap
+    assert marker in gap[0].payload
+
+
+def test_draft_payload_contains_digest_analysis_marker(tmp_vault):
+    marker = "DIGEST_MARKER_AB42"
+    plant_src(tmp_vault, "pay-draft")
+    rt = _rt(digest=f"preceding analysis {marker}\n")
+    run(execute_run(tmp_vault, "What is X?", rt, profile="full", tag="pay-draft"))
+    drafts = [c for c in rt.calls if c.role == "draft"]
+    assert drafts
+    assert marker in drafts[0].payload

@@ -55,7 +55,7 @@ def _effective_word_count(text: str, chars_per_word: float) -> float:
 
 EVENTS_NAME = "events.jsonl"
 
-RUN_STATUSES = ("running", "paused", "blocked", "done", "failed", "aborted")
+RUN_STATUSES = ("running", "paused", "blocked", "done", "failed", "aborted", "completed", "verified")
 STEP_STATUSES = ("pending", "running", "done", "skipped", "failed")
 
 # Step 1.5 (chapter partition) registers each chapter by emitting this event

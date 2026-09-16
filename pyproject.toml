@@ -97,6 +97,8 @@ ignore = [
 "tests/test_core/test_render.py" = ["RUF001", "RUF002"]
 "tests/test_core/test_prompt_golden.py" = ["RUF001", "RUF002"]
 "tests/test_cli/test_install_profile.py" = ["RUF001", "RUF002"]
+"src/hyperresearch/runtime/errors.py" = ["N818"]
+"src/hyperresearch/pipeline/patch.py" = ["N818"]
 
 [tool.mypy]
 python_version = "3.11"

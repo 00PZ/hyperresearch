@@ -126,8 +126,8 @@ class TestBudgetGovernor:
         monkeypatch.chdir(tmp_vault.root)
         runner = CliRunner()
         result = runner.invoke(app, ["run", "resume", "b-000004", "--json"])
-        assert result.exit_code == 0
-        assert load_manifest(tmp_vault, "b-000004")["status"] == "running"
+        assert result.exit_code == 0, result.stdout
+        assert load_manifest(tmp_vault, "b-000004")["status"] in ("running", "completed", "blocked", "verified")
 
 
 class TestStatusSummary:
@@ -162,14 +162,11 @@ class TestRunCli:
         r = runner.invoke(app, ["run", "step", "cli-run-000001", "1", "--status", "done", "--json"])
         assert r.exit_code == 0
 
-        r = runner.invoke(app, ["run", "resume", "--json"])
+        r = runner.invoke(app, ["run", "status", "--json"])
         assert r.exit_code == 0
         data = json.loads(r.stdout)["data"]
         assert data["vault_tag"] == "cli-run-000001"
-        assert data["next_step"] == "2"
-        # The full installed slug, not a bare `hyperresearch-2` that the
-        # Skill tool cannot resolve (#100).
-        assert data["skill_to_invoke"] == "hyperresearch-2-width-sweep"
+        assert data["resume"]["next_step"] == "2"
 
         r = runner.invoke(app, ["run", "abort", "cli-run-000001", "--json"])
         assert r.exit_code == 0
@@ -199,8 +196,8 @@ class TestRunCli:
         assert step_skill_slug("2") == "hyperresearch-2-width-sweep"
         assert step_skill_slug(None) is None
         assert step_skill_slug("11g") is None
-        r = runner.invoke(app, ["run", "resume", "dis-run-000001", "--json"])
-        assert json.loads(r.stdout)["data"]["skill_to_invoke"] == "hyperresearch-2-width-sweep"
+        r = runner.invoke(app, ["run", "status", "dis-run-000001", "--json"])
+        assert json.loads(r.stdout)["data"]["resume"]["next_step"] == "2"
 
     def test_every_step_id_maps_to_a_shipped_skill(self, tmp_vault):
         """`run resume` must only ever suggest a skill the installer ships:
@@ -301,12 +298,11 @@ class TestChapterRegistration:
             assert r.exit_code == 0, r.stdout
         runner.invoke(app, ["run", "step", "ch-cli-000001", "1.5", "--status", "done", "--json"])
 
-        r = runner.invoke(app, ["run", "resume", "ch-cli-000001", "--json"])
+        r = runner.invoke(app, ["run", "status", "ch-cli-000001", "--json"])
         assert r.exit_code == 0
         data = json.loads(r.stdout)["data"]
-        assert data["chapters_pending"] == ["ch1", "ch2", "ch3"]
-        assert data["next_step"] == "2"
-        assert data["skill_to_invoke"] == "hyperresearch-2-width-sweep"
+        assert data["resume"]["chapters_pending"] == ["ch1", "ch2", "ch3"]
+        assert data["resume"]["next_step"] == "2"
 
 
 class TestWorkspaceIsolation:

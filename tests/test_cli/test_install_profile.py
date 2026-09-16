@@ -16,7 +16,7 @@ def _sweep_text(vault) -> str:
 
 def test_install_default_profile_is_full(tmp_vault, monkeypatch):
     monkeypatch.chdir(tmp_vault.root)
-    result = runner.invoke(app, ["install", str(tmp_vault.root), "--json"])
+    result = runner.invoke(app, ["install", str(tmp_vault.root), "--claude", "--json"])
     assert result.exit_code == 0
     sweep = _sweep_text(tmp_vault)
     assert "**40–100 planned searches**" in sweep  # full profile primary
@@ -26,7 +26,7 @@ def test_install_default_profile_is_full(tmp_vault, monkeypatch):
 def test_install_profile_light_changes_primary(tmp_vault, monkeypatch):
     monkeypatch.chdir(tmp_vault.root)
     result = runner.invoke(
-        app, ["install", str(tmp_vault.root), "--profile", "light", "--json"]
+        app, ["install", str(tmp_vault.root), "--claude", "--profile", "light", "--json"]
     )
     assert result.exit_code == 0
     sweep = _sweep_text(tmp_vault)
@@ -43,7 +43,7 @@ def test_install_profile_light_changes_primary(tmp_vault, monkeypatch):
 def test_install_unknown_profile_fails_cleanly(tmp_vault, monkeypatch):
     monkeypatch.chdir(tmp_vault.root)
     result = runner.invoke(
-        app, ["install", str(tmp_vault.root), "--profile", "bogus", "--json"]
+        app, ["install", str(tmp_vault.root), "--claude", "--profile", "bogus", "--json"]
     )
     assert result.exit_code == 1
     # No half-written render should exist from the failed run: install validates
@@ -67,10 +67,10 @@ def test_install_steps_only_renders(tmp_vault, monkeypatch):
 
 def test_reinstall_is_idempotent_per_profile(tmp_vault, monkeypatch):
     monkeypatch.chdir(tmp_vault.root)
-    first = runner.invoke(app, ["install", str(tmp_vault.root), "--json"])
+    first = runner.invoke(app, ["install", str(tmp_vault.root), "--claude", "--json"])
     assert first.exit_code == 0
     before = _sweep_text(tmp_vault)
-    second = runner.invoke(app, ["install", str(tmp_vault.root), "--json"])
+    second = runner.invoke(app, ["install", str(tmp_vault.root), "--claude", "--json"])
     assert second.exit_code == 0
     assert _sweep_text(tmp_vault) == before
 
@@ -96,13 +96,13 @@ def test_bare_install_keeps_persisted_gear(tmp_vault, monkeypatch):
     assert use.exit_code == 0
     # A later bare install (e.g. after a package upgrade) must NOT silently
     # downshift the gear back to full.
-    result = runner.invoke(app, ["install", str(tmp_vault.root), "--json"])
+    result = runner.invoke(app, ["install", str(tmp_vault.root), "--claude", "--json"])
     assert result.exit_code == 0
     sweep = _sweep_text(tmp_vault)
     assert 'rendered from profile "premier"' in sweep
     # An explicit --profile still overrides the persisted gear
     result = runner.invoke(
-        app, ["install", str(tmp_vault.root), "--profile", "full", "--json"]
+        app, ["install", str(tmp_vault.root), "--claude", "--profile", "full", "--json"]
     )
     assert result.exit_code == 0
     assert 'rendered from profile "full"' in _sweep_text(tmp_vault)

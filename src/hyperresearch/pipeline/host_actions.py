@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -17,7 +18,7 @@ from hyperresearch.core.runs import add_spend, load_manifest, set_status
 from hyperresearch.core.vault import Vault
 from hyperresearch.pipeline.checkpoints import TaskLog, dump_agent_result
 from hyperresearch.pipeline.patch import content_hash
-from hyperresearch.runtime.errors import IllegalHostAction
+from hyperresearch.runtime.errors import IllegalHostAction, UncertainSubmission
 from hyperresearch.runtime.parse import assert_action_allowed, iter_host_actions
 from hyperresearch.runtime.types import (
     AgentResult,
@@ -65,6 +66,8 @@ class SpendLedger:
     tag: str
     default_call_cost: float = DEFAULT_CALL_COST_USD
     pending: float = 0.0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+    _last_actual: float | None = None
 
     def spent(self) -> float:
         manifest = load_manifest(self.vault, self.tag)
@@ -74,30 +77,50 @@ class SpendLedger:
         budget = load_manifest(self.vault, self.tag).get("budget_usd")
         return None if budget is None else float(budget)
 
-    def can_dispatch(self) -> bool:
-        ceil = self.ceiling()
-        if ceil is None:
+    def proposed(self, amount: float | None = None) -> float:
+        """Justified reservation: explicit amount, else last actual, else default."""
+        if amount is not None:
+            return float(amount)
+        with self._lock:
+            if self._last_actual is not None:
+                return self._last_actual
+            return self.default_call_cost
+
+    def can_dispatch(self, amount: float | None = None) -> bool:
+        cost = self.proposed(amount)
+        with self._lock:
+            return self._fits_unlocked(cost)
+
+    def reserve(self, amount: float | None = None) -> bool:
+        cost = self.proposed(amount)
+        with self._lock:
+            if not self._fits_unlocked(cost):
+                return False
+            self.pending = round(self.pending + cost, 4)
             return True
-        return self.spent() + self.pending < ceil
 
-    def reserve(self) -> bool:
-        if not self.can_dispatch():
-            return False
-        self.pending = round(self.pending + self.default_call_cost, 4)
-        return True
+    def release(self, amount: float | None = None) -> None:
+        cost = self.default_call_cost if amount is None else float(amount)
+        with self._lock:
+            self.pending = max(0.0, round(self.pending - cost, 4))
 
-    def release(self) -> None:
-        self.pending = max(0.0, round(self.pending - self.default_call_cost, 4))
-
-    def settle(self, result: AgentResult) -> None:
+    def settle(self, result: AgentResult, reserved: float | None = None) -> None:
         actual = _cost_of(result)
         if actual <= 0:
             actual = self.default_call_cost
-        self.release()
+        self.release(self.default_call_cost if reserved is None else reserved)
+        with self._lock:
+            self._last_actual = actual
         add_spend(self.vault, self.tag, estimated_usd=actual, agents_spawned=1)
 
     def block(self) -> None:
         set_status(self.vault, self.tag, "blocked", blocked_on="budget")
+
+    def _fits_unlocked(self, amount: float) -> bool:
+        ceil = self.ceiling()
+        if ceil is None:
+            return True
+        return round(self.spent() + self.pending + amount, 4) <= round(ceil, 4)
 
 
 def evidence_path(vault: Vault, tag: str) -> Path:
@@ -409,8 +432,11 @@ async def run_host_action_loop(
         if not skipped:
             if log is not None:
                 log.begin(model_id, "model", {"role": task.role})
-            if ledger is not None and not ledger.reserve():
-                _block_budget(ledger)
+            cost = 0.0
+            if ledger is not None:
+                cost = ledger.proposed()
+                if not ledger.reserve(cost):
+                    _block_budget(ledger)
             step_task = AgentTask(
                 task_id=model_id,
                 role=task.role,
@@ -421,13 +447,19 @@ async def run_host_action_loop(
             )
             try:
                 last = await runtime.run(step_task, context)
+            except UncertainSubmission:
+                if ledger is not None:
+                    ledger.release(cost)
+                if log is not None:
+                    log.mark_uncertain_remote(model_id)
+                raise RuntimeError(f"uncertain_remote:{model_id}") from None
             except Exception:
                 if ledger is not None:
-                    ledger.release()
+                    ledger.release(cost)
                 raise
             spent_local += _cost_of(last) or (ledger.default_call_cost if ledger else 0.0)
             if ledger is not None:
-                ledger.settle(last)
+                ledger.settle(last, reserved=cost)
             if log is not None:
                 log.succeed(model_id, dump_agent_result(last))
         actions = iter_host_actions(last.structured)

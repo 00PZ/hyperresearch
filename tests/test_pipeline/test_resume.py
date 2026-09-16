@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
+import httpx
 import pytest
 
 from hyperresearch.pipeline.checkpoints import UNCERTAIN_REMOTE, TaskLog, dump_agent_result
@@ -20,6 +22,7 @@ from hyperresearch.runtime import (
     AgentResult,
     AgentTask,
     FakeRuntime,
+    ModelRuntime,
     ResearchContext,
     RuntimeFailure,
     RuntimeTimeout,
@@ -121,6 +124,57 @@ def test_run_many_timeout_does_not_retry_task_id(tmp_path):
     assert calls.count("b") == 1
     assert calls.count("a") == 1
     assert calls.count("c") == 1
+    assert log.get("b") is not None
+    assert log.get("b").status == UNCERTAIN_REMOTE
+    assert log.is_success("a")
+    assert log.is_success("c")
+
+
+def _ok_chat(content: str = "ok") -> httpx.Response:
+    return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+
+def _model_runtime(handler) -> ModelRuntime:
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(transport=transport)
+    return ModelRuntime(
+        base_url="https://example.test/v1",
+        api_key="sk-test",
+        default_model="m",
+        client=client,
+    )
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: httpx.ReadError("connection reset after provider accepted request"),
+        lambda: httpx.RemoteProtocolError("peer closed connection"),
+    ],
+)
+def test_run_many_uncertain_transport_one_post(tmp_path, factory):
+    posts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        text = body["messages"][0]["content"]
+        posts.append(text)
+        if text == "B":
+            raise factory()
+        return _ok_chat("ok")
+
+    rt = _model_runtime(handler)
+    log = TaskLog(tmp_path / "t.jsonl")
+    tasks = [
+        AgentTask(task_id="a", role="r", payload="A", model="m"),
+        AgentTask(task_id="b", role="r", payload="B", model="m"),
+        AgentTask(task_id="c", role="r", payload="C", model="m"),
+    ]
+    with pytest.raises(RuntimeError, match="uncertain_remote:b"):
+        asyncio.run(run_many_retry(rt, tasks, _ctx(tmp_path), 3, log))
+    assert posts.count("B") == 1
+    assert posts.count("A") == 1
+    assert posts.count("C") == 1
     assert log.get("b") is not None
     assert log.get("b").status == UNCERTAIN_REMOTE
     assert log.is_success("a")

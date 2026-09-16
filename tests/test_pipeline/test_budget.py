@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
-from hyperresearch.core.runs import load_manifest
+from hyperresearch.core.runs import init_run, load_manifest
+from hyperresearch.pipeline.host_actions import SpendLedger
 from hyperresearch.pipeline.orchestrator import execute_run, resume_run
 from hyperresearch.runtime import AgentResult, FakeRuntime
 from tests.test_pipeline.test_full import _rt, plant_src, run
@@ -121,3 +124,37 @@ def test_low_actual_cost_settlement_keeps_remaining_usable(tmp_vault):
     assert spent < 1
     assert result["manifest"]["status"] == "verified"
     assert result["manifest"]["blocked_on"] is None
+
+
+def test_oversized_reservation_not_admitted(tmp_vault):
+    init_run(tmp_vault, "bud-over", profile="full", budget_usd=0.50, query="q")
+    ledger = SpendLedger(tmp_vault, "bud-over", default_call_cost=1.00)
+    assert ledger.reserve(1.00) is False
+    assert ledger.pending == 0.0
+
+
+def test_smaller_fitting_reservation_admitted(tmp_vault):
+    init_run(tmp_vault, "bud-fit", profile="full", budget_usd=0.50, query="q")
+    ledger = SpendLedger(tmp_vault, "bud-fit", default_call_cost=1.00)
+    assert ledger.reserve(0.10) is True
+    assert ledger.pending == pytest.approx(0.10)
+
+
+def test_concurrent_reservations_cannot_each_exceed_ceiling(tmp_vault):
+    init_run(tmp_vault, "bud-conc", profile="full", budget_usd=1.00, query="q")
+    ledger = SpendLedger(tmp_vault, "bud-conc", default_call_cost=1.00)
+    barrier = threading.Barrier(2)
+    got: list[bool] = []
+
+    def attempt() -> None:
+        barrier.wait()
+        got.append(ledger.reserve(1.00))
+
+    threads = [threading.Thread(target=attempt) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert got.count(True) == 1
+    assert got.count(False) == 1
+    assert ledger.pending == pytest.approx(1.00)

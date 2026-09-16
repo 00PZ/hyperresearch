@@ -13,12 +13,15 @@ from hyperresearch.runtime import (
     AgentTask,
     ModelRuntime,
     ResearchContext,
+    RuntimeFailure,
     ToolsRequired,
+    UncertainSubmission,
     UnexpectedToolResponse,
 )
 from hyperresearch.runtime.model import (
     capabilities_require_tools,
     chat_completions_url,
+    classify_http_error,
     resolve_provider_model,
 )
 
@@ -216,4 +219,34 @@ class TestModelRuntime:
         assert captured[0]["reasoning_effort"] == "xhigh"
         assert "tools" not in captured[0]
         assert "tool_choice" not in captured[0]
+
+    def test_readerror_after_post_is_uncertain_submission(self, tmp_path):
+        posts: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            posts.append(1)
+            raise httpx.ReadError("connection reset after provider accepted request")
+
+        rt = _runtime(handler)
+        with pytest.raises(UncertainSubmission, match="connection reset"):
+            run(rt.run(_task(), _ctx(tmp_path)))
+        assert posts == [1]
+
+    def test_remote_protocol_error_is_uncertain_submission(self, tmp_path):
+        posts: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            posts.append(1)
+            raise httpx.RemoteProtocolError("peer closed connection")
+
+        rt = _runtime(handler)
+        with pytest.raises(UncertainSubmission, match="peer closed"):
+            run(rt.run(_task(), _ctx(tmp_path)))
+        assert posts == [1]
+
+    def test_connect_error_is_safe_runtime_failure(self):
+        err = httpx.ConnectError("connection refused")
+        classified = classify_http_error(err)
+        assert isinstance(classified, RuntimeFailure)
+        assert not isinstance(classified, UncertainSubmission)
 

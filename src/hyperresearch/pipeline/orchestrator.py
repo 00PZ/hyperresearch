@@ -38,7 +38,7 @@ from hyperresearch.pipeline.prompts import (
     report_extra,
     role_payload,
 )
-from hyperresearch.runtime.errors import BrowserUnsupported, RuntimeTimeout
+from hyperresearch.runtime.errors import BrowserUnsupported, RuntimeFailure, UncertainSubmission
 from hyperresearch.runtime.types import (
     AgentResult,
     AgentRuntime,
@@ -179,26 +179,33 @@ async def run_many_retry(
         if decision == UNCERTAIN_REMOTE:
             raise RuntimeError(f"uncertain_remote:{t.task_id}")
         async with sem:
-            if ledger is not None and not ledger.reserve():
-                ledger.block()
-                raise BudgetExhaustedError(t.task_id)
+            cost = 0.0
+            if ledger is not None:
+                cost = ledger.proposed()
+                if not ledger.reserve(cost):
+                    ledger.block()
+                    raise BudgetExhaustedError(t.task_id)
             log.begin(t.task_id, "model", {"role": t.role})
             try:
                 r = await runtime.run(t, context)
-            except RuntimeTimeout:
+            except UncertainSubmission:
                 if ledger is not None:
-                    ledger.release()
+                    ledger.release(cost)
                 log.mark_uncertain_remote(t.task_id)
                 uncertain.append(t.task_id)
                 return
-            except Exception:
+            except RuntimeFailure:
                 if ledger is not None:
-                    ledger.release()
+                    ledger.release(cost)
                 log.fail(t.task_id, "run failed")
                 failed.append(t)
                 return
+            except Exception:
+                if ledger is not None:
+                    ledger.release(cost)
+                raise
             if ledger is not None:
-                ledger.settle(r)
+                ledger.settle(r, reserved=cost)
             log.succeed(t.task_id, dump_agent_result(r))
             results[t.task_id] = r
 
@@ -209,23 +216,26 @@ async def run_many_retry(
         decision = log.resume_model(t.task_id)
         if decision == UNCERTAIN_REMOTE:
             raise RuntimeError(f"uncertain_remote:{t.task_id}")
-        if ledger is not None and not ledger.reserve():
-            ledger.block()
-            raise BudgetExhaustedError(t.task_id)
+        cost = 0.0
+        if ledger is not None:
+            cost = ledger.proposed()
+            if not ledger.reserve(cost):
+                ledger.block()
+                raise BudgetExhaustedError(t.task_id)
         log.begin(t.task_id, "model", {"role": t.role, "retry": True})
         try:
             r = await runtime.run(t, context)
-        except RuntimeTimeout:
+        except UncertainSubmission:
             if ledger is not None:
-                ledger.release()
+                ledger.release(cost)
             log.mark_uncertain_remote(t.task_id)
             raise RuntimeError(f"uncertain_remote:{t.task_id}") from None
         except Exception:
             if ledger is not None:
-                ledger.release()
+                ledger.release(cost)
             raise
         if ledger is not None:
-            ledger.settle(r)
+            ledger.settle(r, reserved=cost)
         log.succeed(t.task_id, dump_agent_result(r))
         results[t.task_id] = r
     return [results[t.task_id] for t in tasks]
@@ -398,23 +408,26 @@ async def _model(
         return log.result_agent(task.task_id, task.model)
     if decision == UNCERTAIN_REMOTE:
         raise RuntimeError(f"uncertain_remote:{task.task_id}")
-    if ledger is not None and not ledger.reserve():
-        ledger.block()
-        raise BudgetExhaustedError(task.task_id)
+    cost = 0.0
+    if ledger is not None:
+        cost = ledger.proposed()
+        if not ledger.reserve(cost):
+            ledger.block()
+            raise BudgetExhaustedError(task.task_id)
     log.begin(task.task_id, "model", {"role": task.role})
     try:
         result = await runtime.run(task, context)
-    except RuntimeTimeout:
+    except UncertainSubmission:
         if ledger is not None:
-            ledger.release()
+            ledger.release(cost)
         log.mark_uncertain_remote(task.task_id)
         raise RuntimeError(f"uncertain_remote:{task.task_id}") from None
     except Exception:
         if ledger is not None:
-            ledger.release()
+            ledger.release(cost)
         raise
     if ledger is not None:
-        ledger.settle(result)
+        ledger.settle(result, reserved=cost)
     log.succeed(task.task_id, dump_agent_result(result))
     return result
 

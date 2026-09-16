@@ -14,6 +14,7 @@ from hyperresearch.runtime.errors import (
     RuntimeFailure,
     RuntimeTimeout,
     ToolsRequired,
+    UncertainSubmission,
     UnexpectedToolResponse,
 )
 from hyperresearch.runtime.parse import parse_structured
@@ -54,6 +55,20 @@ def chat_completions_url(base_url: str) -> str:
     if base.endswith("/chat/completions"):
         return base
     return f"{base}/chat/completions"
+
+
+_UNCERTAIN_TRANSPORT = (httpx.ReadError, httpx.RemoteProtocolError)
+
+
+def classify_http_error(exc: httpx.HTTPError) -> RuntimeFailure | RuntimeTimeout | UncertainSubmission:
+    """Timeout vs uncertain submit vs known-safe failure."""
+    if isinstance(exc, httpx.TimeoutException):
+        return RuntimeTimeout(str(exc))
+    if isinstance(exc, _UNCERTAIN_TRANSPORT):
+        return UncertainSubmission(str(exc))
+    if "connection reset" in str(exc).lower():
+        return UncertainSubmission(str(exc))
+    return RuntimeFailure(str(exc))
 
 
 class ModelRuntime:
@@ -144,10 +159,8 @@ class ModelRuntime:
         client = self._client_or_create()
         try:
             response = await client.post(url, headers=self._headers(), json=body)
-        except httpx.TimeoutException as e:
-            raise RuntimeTimeout(str(e)) from e
         except httpx.HTTPError as e:
-            raise RuntimeFailure(str(e)) from e
+            raise classify_http_error(e) from e
 
         if response.status_code >= 400:
             raise RuntimeFailure(f"HTTP {response.status_code}: {response.text[:500]}")

@@ -8,10 +8,14 @@ class AgentRuntimeError(Exception):
 
 
 class RuntimeFailure(AgentRuntimeError):  # noqa: N818
-    """Provider/runtime failed the call."""
+    """Provider/runtime failed the call. Safe to retry the same task_id."""
 
 
-class RuntimeTimeout(AgentRuntimeError):  # noqa: N818
+class UncertainSubmission(AgentRuntimeError):  # noqa: N818
+    """Request may have been accepted remotely. Do not auto-retry."""
+
+
+class RuntimeTimeout(UncertainSubmission):
     """Call exceeded the host timeout."""
 
 

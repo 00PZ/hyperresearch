@@ -8,6 +8,7 @@ from hyperresearch.runtime.errors import (
     RuntimeFailure,
     RuntimeTimeout,
     ToolsRequired,
+    UncertainSubmission,
     UnexpectedToolResponse,
 )
 from hyperresearch.runtime.fake import FakeRuntime
@@ -35,6 +36,7 @@ __all__ = [
     "RuntimeFailure",
     "RuntimeTimeout",
     "ToolsRequired",
+    "UncertainSubmission",
     "UnexpectedToolResponse",
     "capabilities_require_tools",
 ]

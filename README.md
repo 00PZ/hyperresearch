@@ -11,7 +11,9 @@
 
 ---
 
-**Hyperresearch turns Claude Code into a deep research agent: one that currently leads the DeepResearch-Bench RACE leaderboard (benchmarked internally).** A tier-adaptive 16-step pipeline takes one prompt and produces an adversarially-audited report with full source provenance. Every source it reads lands in a persistent, searchable vault, so each session starts smarter than the last.
+**Hyperresearch** runs a tier-adaptive 16-step research pipeline as ordinary Python. Default path: `hpr run "<query>"` — Claude Code is not required.
+
+**Fork baseline:** [`jordan-gibbs/hyperresearch`](https://github.com/jordan-gibbs/hyperresearch) commit [`75b1ecfb2891184fad2cc1a2ddf9abe476f5b54c`](https://github.com/jordan-gibbs/hyperresearch/commit/75b1ecfb2891184fad2cc1a2ddf9abe476f5b54c). Pin that SHA, not the version string alone (package metadata still says 0.11.1).
 
 <p align="center">
   <img src="assets/benchmark.png" alt="DeepResearch-Bench top-5 hyperresearch leads the chart ahead of Grep Deep Research, Cellcog Max, nvidia-aiq, Gemini Deep Research, and OpenAI Deep Research" width="780">
@@ -34,15 +36,20 @@
 ## Install
 
 ```bash
-cd your-project
-pip install hyperresearch && hyperresearch install
+pip install hyperresearch
+hpr init
+hpr run "your research question"
 ```
 
-Then `/hyperresearch <anything>` in Claude Code.
+Python 3.11–3.13. (3.14 not supported. Use `uv venv -p 3.12` or `pyenv install 3.12`.)
 
-> Python 3.11–3.13. (3.14 not yet supported. Use `pyenv install 3.13`, `uv venv -p 3.13`, or `py -3.13 -m venv .venv`.)
->
-> Power users: `hyperresearch install --global` makes `/hyperresearch` reachable from every Claude Code session anywhere, at the cost of ~15 lines in every session's system reminder. Per-project install (above) keeps unrelated CC sessions clean.
+Optional Claude Code extra (slash command `/hyperresearch`, not the default CLI path):
+
+```bash
+hyperresearch install
+```
+
+`hyperresearch install --global` installs the Claude session skill; it is not required to run research.
 
 ---
 
@@ -219,12 +226,12 @@ Retracted sources are floored to near-zero quality, and a ship-time retraction s
 Every run owns an isolated workspace (`research/runs/<vault_tag>/`) and a manifest. Concurrent runs never collide, and a crashed run resumes exactly where it stopped:
 
 ```bash
-hyperresearch run status -j          # Step-by-step status, spend, escalation queue depth
-hyperresearch run resume -j          # Exact next step + Skill invocation to continue
-hyperresearch run report -j          # Per-step wall-time / spend / source-yield telemetry
-hyperresearch run verify <tag> -j    # Ship gate: headings, length, citation density, cite-check resolution
+hpr run "your research question"   # Host-owned pipeline (FakeRuntime or ModelRuntime)
+hyperresearch run status -j        # Step-by-step status, spend, escalation queue depth
+hyperresearch run resume -j        # Continue from last checkpoint (next host step, not a Claude Skill)
+hyperresearch run report -j        # Per-step wall-time / spend / source-yield telemetry
+hyperresearch run verify <tag> -j  # Ship gate: headings, length, citation density, cite-check resolution
 ```
-
 `run init --budget 50` caps estimated API-equivalent spend; crossing the cap blocks the run rather than letting it quietly balloon. And before any report ships, the verification battery runs: **quote-integrity** (every quoted span must exist verbatim in a vault note), **retracted-citations** (citing a retracted source unacknowledged blocks the ship), **numeric-consistency** (numbers untraceable to evidence get flagged), plus the cite-check step's per-citation binding audit.
 
 ---
@@ -364,15 +371,16 @@ Publishers block their own open-access PDFs often enough that one attempt isn't 
 
 - It doesn't replace your judgment on which sources matter. The agent picks, you steer.
 - It can't fetch what's behind a paywall you haven't logged into. Open-access recovery finds a legal free copy when one exists — even when the publisher blocks the fetch outright — but when none exists you get the abstract, or nothing, and the note says so.
-- It runs on Anthropic models via the subagent roster (per-agent assignments come from the profile's model map). Usage scales with tier, gear, and corpus size. If anyone wants to port this to Codex, put up a PR! 
+- Default runtime is **ModelRuntime** (OpenAI-compatible chat/completions, no tools on the wire). Claude Code is an optional session extra, not the research backend.
 - The lint gate catches **structural** failures (missing scaffold, broken provenance, unresolved CRITICALs). It cannot guarantee factual accuracy, that's still your call.
 
 ---
 
 ## Requirements
 
-- Python 3.11+
-- [Claude Code](https://claude.com/claude-code)
+- Python 3.11–3.13
+- An OpenAI-compatible model endpoint for live runs (CI uses FakeRuntime; no model required)
+- Claude Code is **optional** and is not on the default `hpr run` path
 
 ---
 

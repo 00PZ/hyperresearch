@@ -45,9 +45,9 @@ class PatchSet:
 @dataclass(frozen=True)
 class PatchPolicy:
     max_hunk_bytes: int = 8192
-    max_set_bytes: int = 8192
+    max_set_bytes: int = 32768
     max_ops: int = 24
-    max_cumulative_bytes: int = 16384
+    max_cumulative_bytes: int = 65536
     max_cumulative_hunks: int = 64
 
 

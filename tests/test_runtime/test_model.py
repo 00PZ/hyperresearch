@@ -199,3 +199,21 @@ class TestModelRuntime:
         assert captured[0]["model"] == "grok-4-fast"
         assert resolve_provider_model("opus", "grok-4-fast") == "grok-4-fast"
         assert resolve_provider_model("grok-4-fast", "other") == "grok-4-fast"
+
+    def test_reasoning_effort_in_request_without_tools(self, tmp_path):
+        captured: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "ok"}}]},
+            )
+
+        rt = _runtime(handler, reasoning_effort="xhigh")
+        run(rt.run(_task(), _ctx(tmp_path)))
+        assert captured[0]["model"] == "test-model"
+        assert captured[0]["reasoning_effort"] == "xhigh"
+        assert "tools" not in captured[0]
+        assert "tool_choice" not in captured[0]
+

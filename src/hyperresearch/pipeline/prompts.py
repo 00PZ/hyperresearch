@@ -33,6 +33,7 @@ Rules:
 - Do not write the research report in this step.
 - If search errors because the provider cannot search, fetch official https URLs instead.
 - Prefer primary/official sources.
+- Prefer specific documentation chapter/section URLs over site homepages.
 - After successful fetches, you may evidence_read those note ids, then complete.
 """
 

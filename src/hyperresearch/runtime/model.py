@@ -66,6 +66,7 @@ class ModelRuntime:
         api_key: str,
         default_model: str,
         timeout_s: float = 120.0,
+        reasoning_effort: str | None = None,
         capabilities: dict[str, Any] | None = None,
         tools_required: bool = False,
         client: httpx.AsyncClient | None = None,
@@ -78,6 +79,7 @@ class ModelRuntime:
         self.api_key = api_key
         self.default_model = default_model
         self.timeout_s = timeout_s
+        self.reasoning_effort = reasoning_effort
         self._client = client
         self._owns_client = client is None
         self.last_request_body: dict[str, Any] | None = None
@@ -93,6 +95,15 @@ class ModelRuntime:
         model = kwargs.pop("default_model", None) or os.environ.get("HYPERRESEARCH_MODEL") or os.environ.get(
             "OPENAI_MODEL", "gpt-4o-mini"
         )
+        effort = kwargs.pop("reasoning_effort", None) or os.environ.get("HYPERRESEARCH_REASONING_EFFORT") or None
+        if effort:
+            kwargs["reasoning_effort"] = effort
+        if kwargs.get("timeout_s") is None:
+            raw = os.environ.get("HYPERRESEARCH_MODEL_TIMEOUT_S")
+            if raw:
+                kwargs["timeout_s"] = float(raw)
+            elif effort in {"high", "xhigh"}:
+                kwargs["timeout_s"] = 3600.0
         return cls(base_url=base, api_key=key, default_model=model, **kwargs)
 
     def _client_or_create(self) -> httpx.AsyncClient:
@@ -118,6 +129,8 @@ class ModelRuntime:
             "model": model,
             "messages": [{"role": "user", "content": task.payload}],
         }
+        if self.reasoning_effort:
+            body["reasoning_effort"] = self.reasoning_effort
         if task.output_schema is not None:
             body["response_format"] = {"type": "json_object"}
         return body

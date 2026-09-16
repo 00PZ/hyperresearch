@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import time
 from collections.abc import Callable
@@ -12,8 +13,10 @@ from typing import Any
 from urllib.parse import urlparse
 
 from hyperresearch.core.profiles import Profile
+from hyperresearch.core.runs import add_spend, load_manifest, set_status
 from hyperresearch.core.vault import Vault
-from hyperresearch.pipeline.checkpoints import TaskLog
+from hyperresearch.pipeline.checkpoints import TaskLog, dump_agent_result
+from hyperresearch.pipeline.patch import content_hash
 from hyperresearch.runtime.errors import IllegalHostAction
 from hyperresearch.runtime.parse import assert_action_allowed, iter_host_actions
 from hyperresearch.runtime.types import (
@@ -26,6 +29,13 @@ from hyperresearch.runtime.types import (
 
 _NOTE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$")
 _SAFE_QUERY_MAX = 2000
+EVIDENCE_MANIFEST = "evidence.json"
+# Token-only usage (no cost_usd) reserves this many USD per model dispatch.
+DEFAULT_CALL_COST_USD = 1.0
+
+
+class BudgetExhaustedError(Exception):
+    """Run-wide spend ceiling hit. Do not dispatch."""
 
 
 @dataclass(frozen=True)
@@ -48,6 +58,111 @@ def budget_from_profile(profile: Profile, manifest: dict[str, Any]) -> HostBudge
 
 
 @dataclass
+class SpendLedger:
+    """Durable run-wide spend. Resume restores from the manifest."""
+
+    vault: Vault
+    tag: str
+    default_call_cost: float = DEFAULT_CALL_COST_USD
+
+    def spent(self) -> float:
+        manifest = load_manifest(self.vault, self.tag)
+        return float((manifest.get("spend") or {}).get("estimated_usd") or 0.0)
+
+    def ceiling(self) -> float | None:
+        budget = load_manifest(self.vault, self.tag).get("budget_usd")
+        return None if budget is None else float(budget)
+
+    def can_dispatch(self) -> bool:
+        ceil = self.ceiling()
+        if ceil is None:
+            return True
+        return self.spent() < ceil
+
+    def reserve(self) -> bool:
+        if not self.can_dispatch():
+            return False
+        add_spend(self.vault, self.tag, estimated_usd=self.default_call_cost, agents_spawned=1)
+        return True
+
+    def settle(self, result: AgentResult) -> None:
+        actual = _cost_of(result)
+        if actual <= 0:
+            actual = self.default_call_cost
+        delta = actual - self.default_call_cost
+        if delta:
+            add_spend(self.vault, self.tag, estimated_usd=delta)
+
+    def block(self) -> None:
+        set_status(self.vault, self.tag, "blocked", blocked_on="budget")
+
+
+def evidence_path(vault: Vault, tag: str) -> Path:
+    return vault.run_dir(tag) / EVIDENCE_MANIFEST
+
+
+def load_evidence(vault: Vault, tag: str) -> list[dict[str, Any]]:
+    path = evidence_path(vault, tag)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, dict):
+        return []
+    sources = data.get("sources")
+    return list(sources) if isinstance(sources, list) else []
+
+
+def record_evidence(
+    vault: Vault,
+    tag: str,
+    note_id: str,
+    url: str,
+    body_hash: str,
+    origin: str,
+) -> None:
+    sources = load_evidence(vault, tag)
+    entry = {
+        "note_id": note_id,
+        "url": url,
+        "content_hash": body_hash,
+        "origin": origin,
+    }
+    by_id: dict[str, dict[str, Any]] = {}
+    for src in sources:
+        nid = str(src.get("note_id") or "")
+        if nid:
+            by_id[nid] = src
+    by_id[note_id] = entry
+    path = evidence_path(vault, tag)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"sources": list(by_id.values())}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def evidence_content_hash(vault: Vault, tag: str) -> str:
+    """Identity of selected source bytes, not of evidence-digest.md."""
+    lines: list[str] = []
+    for src in load_evidence(vault, tag):
+        note_id = str(src.get("note_id") or "")
+        npath = vault.notes_dir / f"{note_id}.md"
+        body = npath.read_text(encoding="utf-8-sig") if npath.exists() else ""
+        lines.append(f"{note_id}:{content_hash(body)}")
+    return content_hash("\n".join(sorted(lines)))
+
+
+def _note_hash(vault: Vault, note_id: str) -> str:
+    npath = vault.notes_dir / f"{note_id}.md"
+    if not npath.exists():
+        return content_hash("")
+    return content_hash(npath.read_text(encoding="utf-8-sig"))
+
+
+@dataclass
 class HostExecutor:
     vault: Vault
     workspace_root: Path
@@ -55,6 +170,7 @@ class HostExecutor:
     fetch_fn: Callable[..., Any] | None = None
     spent_usd: float = 0.0
     fetches: list[str] = field(default_factory=list)
+    run_tag: str = ""
 
     def execute(self, action: HostAction, *, task_id: str) -> dict[str, Any]:
         if action.kind == "complete":
@@ -132,6 +248,9 @@ class HostExecutor:
         tags = action.args.get("tags") or []
         if not isinstance(tags, list):
             raise IllegalHostAction("fetch tags must be a list")
+        tags = [str(t) for t in tags]
+        if self.run_tag and self.run_tag not in tags:
+            tags.append(self.run_tag)
         try:
             if self.fetch_fn is not None:
                 result = self.fetch_fn(url, tags=tags)
@@ -158,6 +277,15 @@ class HostExecutor:
             return {"task_id": task_id, "kind": "fetch", "ok": False, "url": url, "error": str(e)}
         self.fetches.append(url)
         note_id = result.get("note_id") if isinstance(result, dict) else None
+        if self.run_tag and note_id:
+            record_evidence(
+                self.vault,
+                self.run_tag,
+                str(note_id),
+                url,
+                _note_hash(self.vault, str(note_id)),
+                "fetched",
+            )
         body = repr(result)
         return {
             "task_id": task_id,
@@ -200,6 +328,8 @@ class HostExecutor:
         except Exception:
             pass
         digest = hashlib.sha256(text.encode()).hexdigest()
+        if self.run_tag:
+            record_evidence(self.vault, self.run_tag, note_id, source, digest, "reused")
         return {
             "task_id": task_id,
             "kind": "evidence_read",
@@ -231,6 +361,12 @@ def _cost_of(result: AgentResult) -> float:
     return 0.0
 
 
+def _block_budget(ledger: SpendLedger | None) -> None:
+    if ledger is not None:
+        ledger.block()
+    raise BudgetExhaustedError("budget exhausted")
+
+
 async def run_host_action_loop(
     runtime: AgentRuntime,
     task: AgentTask,
@@ -240,39 +376,52 @@ async def run_host_action_loop(
     log: TaskLog | None = None,
     *,
     task_id_prefix: str | None = None,
+    ledger: SpendLedger | None = None,
 ) -> AgentResult:
     """Repeat until complete or budget exhausted. Host validates and executes."""
     prefix = task_id_prefix or task.task_id
     payload = task.payload
     last = AgentResult(text="", requested_model=task.model)
     started = time.monotonic()
-    spent = 0.0
+    spent_local = 0.0
     for i in range(budget.max_iterations):
         if time.monotonic() - started > budget.max_seconds:
             break
-        if spent >= budget.max_cost_usd:
+        run_spent = ledger.spent() if ledger is not None else spent_local
+        if run_spent >= budget.max_cost_usd:
+            if ledger is not None:
+                ledger.block()
             break
+        if ledger is not None and not ledger.can_dispatch():
+            _block_budget(ledger)
         model_id = f"{prefix}-model-{i}"
+        skipped = False
         if log is not None:
             decision = log.resume_model(model_id)
             if decision == "skip":
-                last = AgentResult(text=log.result_text(model_id), requested_model=task.model)
-                continue
-            if decision == "uncertain_remote":
+                last = log.result_agent(model_id, task.model)
+                skipped = True
+            elif decision == "uncertain_remote":
                 raise RuntimeError(f"uncertain_remote:{model_id}")
-            log.begin(model_id, "model", {"role": task.role})
-        step_task = AgentTask(
-            task_id=model_id,
-            role=task.role,
-            payload=payload,
-            model=task.model,
-            output_schema=task.output_schema,
-            allowed_actions=task.allowed_actions,
-        )
-        last = await runtime.run(step_task, context)
-        spent += _cost_of(last)
-        if log is not None:
-            log.succeed(model_id, {"text": last.text[:2000]})
+        if not skipped:
+            if log is not None:
+                log.begin(model_id, "model", {"role": task.role})
+            if ledger is not None and not ledger.reserve():
+                _block_budget(ledger)
+            step_task = AgentTask(
+                task_id=model_id,
+                role=task.role,
+                payload=payload,
+                model=task.model,
+                output_schema=task.output_schema,
+                allowed_actions=task.allowed_actions,
+            )
+            last = await runtime.run(step_task, context)
+            spent_local += _cost_of(last) or (ledger.default_call_cost if ledger else 0.0)
+            if ledger is not None:
+                ledger.settle(last)
+            if log is not None:
+                log.succeed(model_id, dump_agent_result(last))
         actions = iter_host_actions(last.structured)
         if not actions:
             if any(k in task.allowed_actions for k in ("search", "fetch")):
@@ -310,6 +459,4 @@ async def run_host_action_loop(
 
 
 def _format_prov(items: list[dict[str, Any]]) -> str:
-    import json
-
     return json.dumps(items, ensure_ascii=False, indent=2)

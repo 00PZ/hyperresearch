@@ -5,9 +5,17 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from hyperresearch.pipeline.checkpoints import UNCERTAIN_REMOTE, TaskLog
-from hyperresearch.pipeline.orchestrator import run_many_retry
-from hyperresearch.runtime import AgentTask, FakeRuntime, ResearchContext, RuntimeFailure
+from hyperresearch.pipeline.checkpoints import UNCERTAIN_REMOTE, TaskLog, dump_agent_result
+from hyperresearch.pipeline.host_actions import HostBudget, HostExecutor, run_host_action_loop
+from hyperresearch.pipeline.orchestrator import _maybe_patches, run_many_retry
+from hyperresearch.pipeline.patch import PatchState, apply_patch_set, content_hash
+from hyperresearch.runtime import (
+    AgentResult,
+    AgentTask,
+    FakeRuntime,
+    ResearchContext,
+    RuntimeFailure,
+)
 
 
 def _ctx(tmp_path: Path) -> ResearchContext:
@@ -84,3 +92,179 @@ def test_run_many_skip_already_successful(tmp_path):
     assert results[1].text == "fresh"
     assert "a" not in calls
     assert calls == ["b"]
+
+
+def test_crash_between_model_success_and_first_action_still_fetches(tmp_vault):
+    tag = "r-crash1"
+    log = TaskLog(tmp_vault.run_dir(tag) / "task_log.jsonl")
+    tmp_vault.run_dir(tag).mkdir(parents=True, exist_ok=True)
+    result = AgentResult(
+        text="fetch",
+        structured={"kind": "fetch", "args": {"url": "https://example.com/a"}, "reason": "x"},
+        requested_model="m",
+    )
+    log.begin("loop-model-0", "model")
+    log.succeed("loop-model-0", dump_agent_result(result))
+    fetches: list[str] = []
+
+    def fetch_fn(url, tags=None):
+        fetches.append(url)
+        return {"note_id": "n1", "url": url}
+
+    rt = FakeRuntime(default="should-not-rerun-model")
+    run_host_action_loop_sync = asyncio.run
+    out = run_host_action_loop_sync(
+        run_host_action_loop(
+            rt,
+            AgentTask(
+                task_id="loop",
+                role="width",
+                payload="q",
+                model="m",
+                allowed_actions=("search", "fetch", "evidence_read", "complete"),
+            ),
+            _ctx(tmp_vault.root),
+            HostExecutor(vault=tmp_vault, workspace_root=tmp_vault.root, fetch_fn=fetch_fn),
+            HostBudget(max_iterations=1, max_seconds=30, max_cost_usd=99),
+            log,
+            task_id_prefix="loop",
+        )
+    )
+    assert fetches == ["https://example.com/a"]
+    assert rt.calls == []
+    assert out.structured["kind"] == "fetch"
+
+
+def test_crash_between_two_actions(tmp_vault):
+    tag = "r-crash2"
+    log = TaskLog(tmp_vault.run_dir(tag) / "task_log.jsonl")
+    tmp_vault.run_dir(tag).mkdir(parents=True, exist_ok=True)
+    structured = {
+        "actions": [
+            {"kind": "fetch", "args": {"url": "https://example.com/a"}, "reason": "one"},
+            {"kind": "fetch", "args": {"url": "https://example.com/b"}, "reason": "two"},
+        ]
+    }
+    log.begin("loop-model-0", "model")
+    log.succeed(
+        "loop-model-0",
+        dump_agent_result(AgentResult(text="two", structured=structured, requested_model="m")),
+    )
+    log.begin("loop-ha-0-0", "host_action", {"kind": "fetch"})
+    log.succeed("loop-ha-0-0", {"ok": True, "url": "https://example.com/a", "note_id": "a"})
+    fetches: list[str] = []
+
+    def fetch_fn(url, tags=None):
+        fetches.append(url)
+        return {"note_id": "b", "url": url}
+
+    asyncio.run(
+        run_host_action_loop(
+            FakeRuntime(default="no"),
+            AgentTask(
+                task_id="loop",
+                role="width",
+                payload="q",
+                model="m",
+                allowed_actions=("search", "fetch", "evidence_read", "complete"),
+            ),
+            _ctx(tmp_vault.root),
+            HostExecutor(vault=tmp_vault, workspace_root=tmp_vault.root, fetch_fn=fetch_fn),
+            HostBudget(max_iterations=1, max_seconds=30, max_cost_usd=99),
+            log,
+            task_id_prefix="loop",
+        )
+    )
+    assert fetches == ["https://example.com/b"]
+
+
+def test_restore_4000_char_draft_byte_for_byte(tmp_path):
+    log = TaskLog(tmp_path / "t.jsonl")
+    draft = "D" * 4000
+    log.begin("step-10", "model")
+    log.succeed("step-10", dump_agent_result(AgentResult(text=draft, requested_model="m")))
+    restored = log.result_agent("step-10", "m")
+    assert restored.text == draft
+    assert len(restored.text) == 4000
+
+
+def test_restore_and_apply_structured_patch(tmp_vault):
+    path = tmp_vault.root / "research" / "notes" / "final_report_r.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("alpha beta", encoding="utf-8")
+    h = content_hash("alpha beta")
+    structured = {
+        "base_report_hash": h,
+        "ops": [{"old_text": "alpha", "new_text": "ALPHA"}],
+    }
+    log = TaskLog(tmp_vault.root / "research" / "runs" / "r" / "task_log.jsonl")
+    log.path.parent.mkdir(parents=True, exist_ok=True)
+    log.begin("step-14", "model")
+    log.succeed(
+        "step-14",
+        dump_agent_result(AgentResult(text="{}", structured=structured, requested_model="m")),
+    )
+    restored = log.result_agent("step-14", "m")
+    patch_set = _maybe_patches(restored, h)
+    assert patch_set is not None
+    apply_patch_set(
+        path,
+        patch_set,
+        workspace_root=tmp_vault.root,
+        state_path=tmp_vault.root / "research" / "runs" / "r" / "patch-state.json",
+        task_id="step-14-apply",
+        log=log,
+    )
+    assert path.read_text(encoding="utf-8") == "ALPHA beta"
+    assert PatchState.load(tmp_vault.root / "research" / "runs" / "r" / "patch-state.json").cumulative_bytes > 0
+
+
+def test_resumed_context_includes_earlier_evidence(tmp_vault):
+    tag = "r-ev"
+    log = TaskLog(tmp_vault.run_dir(tag) / "task_log.jsonl")
+    tmp_vault.run_dir(tag).mkdir(parents=True, exist_ok=True)
+    log.begin("loop-model-0", "model")
+    log.succeed(
+        "loop-model-0",
+        dump_agent_result(
+            AgentResult(
+                text="fetch",
+                structured={"kind": "fetch", "args": {"url": "https://example.com/ev"}, "reason": "x"},
+                requested_model="m",
+            )
+        ),
+    )
+    seen: list[str] = []
+
+    def fetch_fn(url, tags=None):
+        return {"note_id": "ev1", "url": url, "excerpt": "EVIDENCE_TOKEN"}
+
+    class Spy(FakeRuntime):
+        async def run(self, task, context):
+            seen.append(task.payload)
+            return AgentResult(
+                text="done",
+                structured={"kind": "complete", "args": {}, "reason": "ok"},
+                requested_model="m",
+            )
+
+    asyncio.run(
+        run_host_action_loop(
+            Spy(default="x"),
+            AgentTask(
+                task_id="loop",
+                role="width",
+                payload="CANONICAL",
+                model="m",
+                allowed_actions=("search", "fetch", "evidence_read", "complete"),
+            ),
+            _ctx(tmp_vault.root),
+            HostExecutor(vault=tmp_vault, workspace_root=tmp_vault.root, fetch_fn=fetch_fn, run_tag=tag),
+            HostBudget(max_iterations=4, max_seconds=30, max_cost_usd=99),
+            log,
+            task_id_prefix="loop",
+        )
+    )
+    assert seen
+    assert "https://example.com/ev" in seen[0]
+    assert "host-results" in seen[0]

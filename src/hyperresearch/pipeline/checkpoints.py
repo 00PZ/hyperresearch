@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from hyperresearch.runtime.types import AgentResult
+
 LOG_NAME = "task_log.jsonl"
 TERMINAL_SUCCESS = "success"
 UNCERTAIN_REMOTE = "uncertain_remote"
@@ -65,6 +67,10 @@ class TaskLog:
             return ""
         text = payload.get("text", "")
         return text if isinstance(text, str) else ""
+
+    def result_agent(self, task_id: str, fallback_model: str = "") -> AgentResult:
+        return load_agent_result(self.result_payload(task_id), fallback_model)
+
 
 
     def _append(self, rec: TaskRecord) -> None:
@@ -140,3 +146,28 @@ class TaskLog:
         if rec.status == FAILED:
             return "retry"
         return "launch"
+
+
+def dump_agent_result(result: AgentResult) -> dict[str, Any]:
+    return {
+        "text": result.text,
+        "structured": result.structured,
+        "usage": dict(result.usage or {}),
+        "requested_model": result.requested_model,
+        "reported_model": result.reported_model,
+        "runtime_metadata": dict(result.runtime_metadata or {}),
+    }
+
+
+def load_agent_result(payload: dict[str, Any] | None, fallback_model: str = "") -> AgentResult:
+    if not payload:
+        return AgentResult(text="", requested_model=fallback_model)
+    return AgentResult(
+        text=str(payload.get("text") or ""),
+        structured=payload.get("structured"),
+        usage=dict(payload.get("usage") or {}),
+        requested_model=str(payload.get("requested_model") or fallback_model),
+        reported_model=payload.get("reported_model"),
+        runtime_metadata=dict(payload.get("runtime_metadata") or {}),
+    )
+

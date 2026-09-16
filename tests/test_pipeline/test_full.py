@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 
+from hyperresearch.core.note import write_note
 from hyperresearch.core.runs import load_manifest
+from hyperresearch.pipeline.host_actions import record_evidence
 from hyperresearch.pipeline.orchestrator import (
     CITE_FINDINGS,
     EVIDENCE_DIGEST,
     INDEPENDENCE_ARTIFACT,
+    _evidence_hash,
     _ship,
     execute_run,
     report_path,
@@ -24,6 +27,9 @@ DECOMP = json.dumps({"pipeline_tier": "full", "required_section_headings": ["Fin
 COMPLETE = {"kind": "complete", "args": {}, "reason": "done"}
 EMPTY = '{"applied": []}'
 DIGEST = "evidence snapshot one\n"
+CITE_OK = '{"findings": []}'
+CRITIC_EMPTY = '{"findings": []}'
+SRC_BODY = "Substantive sentence with real evidence attached. Primary source excerpt.\n"
 
 
 def _rt(**overrides):
@@ -39,10 +45,13 @@ def _rt(**overrides):
         "digest": DIGEST,
         "draft": REPORT,
         "synthesizer": REPORT,
-        "critic": "[]",
+        "critic_dialectic": CRITIC_EMPTY,
+        "critic_depth": CRITIC_EMPTY,
+        "critic_width": CRITIC_EMPTY,
+        "critic_instruction": CRITIC_EMPTY,
         "gap_fetch": COMPLETE,
         "patcher": EMPTY,
-        "cite_checker": '{"findings": []}',
+        "cite_checker": CITE_OK,
         "polish": EMPTY,
         "readability": EMPTY,
     }
@@ -54,7 +63,33 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def plant_src(vault, tag: str, *, note_id: str = "src-note", tagged: bool = True) -> None:
+    tags = [tag] if tagged else []
+    write_note(
+        vault.notes_dir,
+        "Source Note",
+        body=SRC_BODY,
+        note_id=note_id,
+        tags=tags,
+        source=f"https://example.com/{note_id}",
+        tier="institutional",
+        content_type="article",
+    )
+    vault.auto_sync()
+    vault.run_dir(tag).mkdir(parents=True, exist_ok=True)
+    npath = vault.notes_dir / f"{note_id}.md"
+    record_evidence(
+        vault,
+        tag,
+        note_id,
+        f"https://example.com/{note_id}",
+        content_hash(npath.read_text(encoding="utf-8-sig")),
+        "reused",
+    )
+
+
 def test_stale_cite_check_hash_is_not_verified(tmp_vault):
+    plant_src(tmp_vault, "fl-old")
     result = run(execute_run(tmp_vault, "What is X?", _rt(), profile="full", tag="fl-old"))
     assert result["manifest"]["status"] == "verified"
     findings_path = tmp_vault.run_dir("fl-old") / CITE_FINDINGS
@@ -74,6 +109,7 @@ def test_stale_cite_check_hash_is_not_verified(tmp_vault):
 def test_polish_that_changes_hash_reruns_cite_check(tmp_vault):
     token = "UNIQTOKEN"
     body = REPORT + f"\n{token}\n"
+    plant_src(tmp_vault, "fl-polish")
     polish = AgentResult(
         text=EMPTY,
         structured={
@@ -114,17 +150,19 @@ def test_polish_that_changes_hash_reruns_cite_check(tmp_vault):
 
 
 def test_full_verified_writes_bound_independence_artifact(tmp_vault):
+    plant_src(tmp_vault, "fl-ind")
     result = run(execute_run(tmp_vault, "What is X?", _rt(), profile="full", tag="fl-ind"))
     assert result["manifest"]["status"] == "verified"
     path = tmp_vault.run_dir("fl-ind") / INDEPENDENCE_ARTIFACT
     data = json.loads(path.read_text(encoding="utf-8"))
-    digest = (tmp_vault.run_dir("fl-ind") / EVIDENCE_DIGEST).read_text(encoding="utf-8-sig")
-    assert data["evidence_hash"] == content_hash(digest)
+    assert data["evidence_hash"] == _evidence_hash(tmp_vault, "fl-ind")
     assert "scored" in data
     assert "clusters" in data
+    assert (tmp_vault.run_dir("fl-ind") / EVIDENCE_DIGEST).exists()
 
 
 def test_stale_independence_evidence_hash_is_not_verified(tmp_vault):
+    plant_src(tmp_vault, "fl-ind-stale")
     result = run(execute_run(tmp_vault, "What is X?", _rt(), profile="full", tag="fl-ind-stale"))
     assert result["manifest"]["status"] == "verified"
     path = tmp_vault.run_dir("fl-ind-stale") / INDEPENDENCE_ARTIFACT
@@ -135,4 +173,3 @@ def test_stale_independence_evidence_hash_is_not_verified(tmp_vault):
     manifest = load_manifest(tmp_vault, "fl-ind-stale")
     assert manifest["status"] == "blocked"
     assert manifest["status"] != "verified"
-

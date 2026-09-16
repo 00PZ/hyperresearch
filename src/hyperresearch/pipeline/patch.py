@@ -166,12 +166,33 @@ def apply_patch_set(
     current_hash = content_hash(current)
     intended = apply_ops(current, patch_set.ops) if current_hash == patch_set.base_report_hash else None
     intended_hash = content_hash(intended) if intended is not None else None
-
     if log is not None:
         rec = log.get(task_id)
         if rec and rec.intended_hash and current_hash == rec.intended_hash:
-            log.succeed(task_id, {"ok": True, "reconciled": True, "hash": current_hash})
-            return {"ok": True, "reconciled": True, "hash": current_hash, "bytes": 0}
+            args = rec.args or {}
+            delta_b = int(args.get("bytes") or 0)
+            delta_h = int(args.get("hunks") or 0)
+            prev_b = int(args.get("prev_bytes") or 0)
+            prev_h = int(args.get("prev_hunks") or 0)
+            target_b = prev_b + delta_b
+            target_h = prev_h + delta_h
+            state = PatchState.load(state_path)
+            if state.cumulative_bytes < target_b or state.cumulative_hunks < target_h:
+                state.cumulative_bytes = target_b
+                state.cumulative_hunks = target_h
+                state.last_report_hash = current_hash
+                state.save(state_path)
+            result = {
+                "ok": True,
+                "reconciled": True,
+                "hash": current_hash,
+                "bytes": delta_b,
+                "hunks": delta_h,
+                "cumulative_bytes": state.cumulative_bytes,
+                "cumulative_hunks": state.cumulative_hunks,
+            }
+            log.succeed(task_id, result)
+            return result
 
     if current_hash != patch_set.base_report_hash:
         raise PatchError(
@@ -188,7 +209,18 @@ def apply_patch_set(
 
     assert intended is not None and intended_hash is not None
     if log is not None:
-        log.begin(task_id, "patch", {"base": patch_set.base_report_hash}, intended_hash=intended_hash)
+        log.begin(
+            task_id,
+            "patch",
+            {
+                "base": patch_set.base_report_hash,
+                "bytes": set_bytes,
+                "hunks": len(patch_set.ops),
+                "prev_bytes": state.cumulative_bytes,
+                "prev_hunks": state.cumulative_hunks,
+            },
+            intended_hash=intended_hash,
+        )
 
     tmp = report_path.with_suffix(report_path.suffix + ".tmp")
     tmp.write_text(intended, encoding="utf-8")

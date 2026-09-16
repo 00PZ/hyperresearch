@@ -10,6 +10,7 @@ from hyperresearch.pipeline.patch import (
     PatchOp,
     PatchPolicy,
     PatchSet,
+    PatchState,
     StructuralEscalationError,
     apply_patch_set,
     content_hash,
@@ -184,3 +185,73 @@ def test_crash_before_checkpoint_reconciles(tmp_vault):
         log=log2,
     )
     assert again.get("skipped") or again.get("reconciled")
+
+
+def test_crash_after_report_replacement_before_counter_persist(tmp_vault, monkeypatch):
+    path = _report(tmp_vault, "old text here")
+    state = tmp_vault.root / "research" / "runs" / "p" / "patch-state.json"
+    log_path = tmp_vault.root / "research" / "runs" / "p" / "task_log.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    h = content_hash(path.read_text(encoding="utf-8"))
+    pset = PatchSet(base_report_hash=h, ops=(PatchOp("old text", "new text"),))
+    n = {"i": 0}
+    real_save = PatchState.save
+
+    def boom(self, path_):
+        n["i"] += 1
+        if n["i"] == 1:
+            raise RuntimeError("save fail")
+        return real_save(self, path_)
+
+    monkeypatch.setattr(PatchState, "save", boom)
+    log = TaskLog(log_path)
+    with pytest.raises(RuntimeError, match="save fail"):
+        apply_patch_set(
+            path,
+            pset,
+            workspace_root=tmp_vault.root,
+            state_path=state,
+            task_id="p-journal",
+            log=log,
+        )
+    assert path.read_text(encoding="utf-8") == "new text here"
+    log2 = TaskLog(log_path)
+    restored = apply_patch_set(
+        path,
+        pset,
+        workspace_root=tmp_vault.root,
+        state_path=state,
+        task_id="p-journal",
+        log=log2,
+    )
+    assert restored.get("reconciled") or restored.get("ok")
+    assert restored["bytes"] > 0
+    assert restored["hunks"] == 1
+    loaded = PatchState.load(state)
+    assert loaded.cumulative_bytes == restored["cumulative_bytes"]
+    assert loaded.cumulative_bytes > 0
+
+    again = apply_patch_set(
+        path,
+        pset,
+        workspace_root=tmp_vault.root,
+        state_path=state,
+        task_id="p-journal",
+        log=log2,
+    )
+    assert again.get("skipped") or again.get("reconciled")
+    assert PatchState.load(state).cumulative_bytes == loaded.cumulative_bytes
+
+    path.write_text("new text here extra", encoding="utf-8")
+    h2 = content_hash(path.read_text(encoding="utf-8"))
+    policy = PatchPolicy(max_cumulative_bytes=loaded.cumulative_bytes + 1)
+    with pytest.raises(StructuralEscalationError, match="cumulative"):
+        apply_patch_set(
+            path,
+            PatchSet(base_report_hash=h2, ops=(PatchOp("extra", "EXTRA"),)),
+            workspace_root=tmp_vault.root,
+            state_path=state,
+            policy=policy,
+            task_id="p-next",
+            log=log2,
+        )

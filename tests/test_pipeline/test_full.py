@@ -6,7 +6,14 @@ import asyncio
 import json
 
 from hyperresearch.core.runs import load_manifest
-from hyperresearch.pipeline.orchestrator import CITE_FINDINGS, _ship, execute_run, report_path
+from hyperresearch.pipeline.orchestrator import (
+    CITE_FINDINGS,
+    EVIDENCE_DIGEST,
+    INDEPENDENCE_ARTIFACT,
+    _ship,
+    execute_run,
+    report_path,
+)
 from hyperresearch.pipeline.patch import content_hash
 from hyperresearch.runtime import AgentResult, FakeRuntime
 
@@ -104,3 +111,28 @@ def test_polish_that_changes_hash_reruns_cite_check(tmp_vault):
     assert findings["report_hash"] == content_hash(text)
     cite_calls = [c for c in rt.calls if c.role == "cite_checker"]
     assert len(cite_calls) == 2
+
+
+def test_full_verified_writes_bound_independence_artifact(tmp_vault):
+    result = run(execute_run(tmp_vault, "What is X?", _rt(), profile="full", tag="fl-ind"))
+    assert result["manifest"]["status"] == "verified"
+    path = tmp_vault.run_dir("fl-ind") / INDEPENDENCE_ARTIFACT
+    data = json.loads(path.read_text(encoding="utf-8"))
+    digest = (tmp_vault.run_dir("fl-ind") / EVIDENCE_DIGEST).read_text(encoding="utf-8-sig")
+    assert data["evidence_hash"] == content_hash(digest)
+    assert "scored" in data
+    assert "clusters" in data
+
+
+def test_stale_independence_evidence_hash_is_not_verified(tmp_vault):
+    result = run(execute_run(tmp_vault, "What is X?", _rt(), profile="full", tag="fl-ind-stale"))
+    assert result["manifest"]["status"] == "verified"
+    path = tmp_vault.run_dir("fl-ind-stale") / INDEPENDENCE_ARTIFACT
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["evidence_hash"] = "0" * 64
+    path.write_text(json.dumps(data), encoding="utf-8")
+    _ship(tmp_vault, "fl-ind-stale", "full")
+    manifest = load_manifest(tmp_vault, "fl-ind-stale")
+    assert manifest["status"] == "blocked"
+    assert manifest["status"] != "verified"
+

@@ -6,7 +6,7 @@ import asyncio
 import json
 
 from hyperresearch.core.runs import load_manifest, verify_run
-from hyperresearch.pipeline.orchestrator import execute_run, report_path
+from hyperresearch.pipeline.orchestrator import INDEPENDENCE_ARTIFACT, execute_run, report_path
 from hyperresearch.pipeline.patch import content_hash
 from hyperresearch.runtime import AgentResult, FakeRuntime
 
@@ -41,6 +41,14 @@ def test_light_ship_pass_is_completed_not_verified(tmp_vault):
     assert manifest["status"] == "completed"
     assert manifest["status"] != "verified"
     assert manifest["status"] != "done"
+    assert not (tmp_vault.run_dir("lt-01") / INDEPENDENCE_ARTIFACT).exists()
+
+
+def test_light_completed_does_not_require_independence(tmp_vault):
+    result = run(execute_run(tmp_vault, "What is X?", _rt(), profile="light", tag="lt-ind"))
+    assert result["manifest"]["status"] == "completed"
+    assert result["manifest"]["status"] != "verified"
+    assert not (tmp_vault.run_dir("lt-ind") / INDEPENDENCE_ARTIFACT).exists()
 
 
 def test_light_ship_fail_blocks(tmp_vault):

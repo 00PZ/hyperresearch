@@ -41,6 +41,7 @@ _INVESTIGATE = ("search", "fetch", "evidence_read", "complete")
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 CITE_FINDINGS = "cite-check-findings.json"
 EVIDENCE_DIGEST = "evidence-digest.md"
+INDEPENDENCE_ARTIFACT = "independence.json"
 
 
 def mint_run_tag(query: str) -> str:
@@ -194,6 +195,46 @@ def _cite_check_bound(vault: Vault, tag: str) -> bool:
         data.get("report_hash") == _report_hash(vault, tag)
         and data.get("evidence_hash") == _evidence_hash(vault, tag)
     )
+
+
+def _write_independence(vault: Vault, tag: str, summary: dict[str, Any]) -> None:
+    data = {
+        "evidence_hash": _evidence_hash(vault, tag),
+        "scored": summary.get("scored", 0),
+        "clusters": list(summary.get("clusters") or []),
+    }
+    (vault.run_dir(tag) / INDEPENDENCE_ARTIFACT).write_text(
+        json.dumps(data, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def _independence_bound(vault: Vault, tag: str) -> bool:
+    path = vault.run_dir(tag) / INDEPENDENCE_ARTIFACT
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    return data.get("evidence_hash") == _evidence_hash(vault, tag)
+
+
+def _block_ship(
+    vault: Vault,
+    tag: str,
+    result: dict[str, Any],
+    *,
+    blocked_on: str,
+    name: str,
+    detail: str,
+) -> dict[str, Any]:
+    set_status(vault, tag, "blocked", blocked_on=blocked_on)
+    failed = dict(result)
+    failed["passed"] = False
+    failed["checks"] = [*result["checks"], {"name": name, "ok": False, "detail": detail}]
+    return failed
 
 
 async def _model(
@@ -483,25 +524,37 @@ def _ship(vault: Vault, tag: str, tier: str) -> dict[str, Any]:
     if tier == "light":
         set_status(vault, tag, "completed")
         return result
-    from hyperresearch.core.independence import compute_independence
+    try:
+        from hyperresearch.core.independence import compute_independence
 
-    compute_independence(vault, tag)
+        summary = compute_independence(vault, tag)
+        path = vault.run_dir(tag) / INDEPENDENCE_ARTIFACT
+        if not path.exists():
+            _write_independence(vault, tag, summary)
+    except Exception as exc:
+        return _block_ship(
+            vault, tag, result,
+            blocked_on="independence",
+            name="independence-final",
+            detail=str(exc),
+        )
+    if not _independence_bound(vault, tag):
+        return _block_ship(
+            vault, tag, result,
+            blocked_on="independence",
+            name="independence-final",
+            detail=f"unbound evidence={_evidence_hash(vault, tag)[:12]}",
+        )
     if not _cite_check_bound(vault, tag):
-        set_status(vault, tag, "blocked", blocked_on="cite-check")
-        failed = dict(result)
-        failed["passed"] = False
-        failed["checks"] = [
-            *result["checks"],
-            {
-                "name": "cite-check-final",
-                "ok": False,
-                "detail": (
-                    f"unbound report={_report_hash(vault, tag)[:12]} "
-                    f"evidence={_evidence_hash(vault, tag)[:12]}"
-                ),
-            },
-        ]
-        return failed
+        return _block_ship(
+            vault, tag, result,
+            blocked_on="cite-check",
+            name="cite-check-final",
+            detail=(
+                f"unbound report={_report_hash(vault, tag)[:12]} "
+                f"evidence={_evidence_hash(vault, tag)[:12]}"
+            ),
+        )
     set_status(vault, tag, "verified")
     return result
 

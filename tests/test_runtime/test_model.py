@@ -16,7 +16,11 @@ from hyperresearch.runtime import (
     ToolsRequired,
     UnexpectedToolResponse,
 )
-from hyperresearch.runtime.model import capabilities_require_tools, chat_completions_url
+from hyperresearch.runtime.model import (
+    capabilities_require_tools,
+    chat_completions_url,
+    resolve_provider_model,
+)
 
 
 def _ctx(tmp_path: Path) -> ResearchContext:
@@ -155,3 +159,43 @@ class TestModelRuntime:
     def test_chat_url(self):
         assert chat_completions_url("https://api.openai.com/v1") == "https://api.openai.com/v1/chat/completions"
         assert chat_completions_url("https://x/v1/chat/completions") == "https://x/v1/chat/completions"
+
+    def test_claude_aliases_map_to_default_model(self, tmp_path):
+        captured: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "ok"}}]},
+            )
+
+        rt = _runtime(handler)
+        result = run(rt.run(_task(model="opus"), _ctx(tmp_path)))
+        assert captured[0]["model"] == "test-model"
+        assert result.requested_model == "test-model"
+        captured.clear()
+        run(rt.run(_task(model="sonnet"), _ctx(tmp_path)))
+        assert captured[0]["model"] == "test-model"
+        captured.clear()
+        run(rt.run(_task(model="haiku"), _ctx(tmp_path)))
+        assert captured[0]["model"] == "test-model"
+        captured.clear()
+        run(rt.run(_task(model="default"), _ctx(tmp_path)))
+        assert captured[0]["model"] == "test-model"
+
+    def test_explicit_provider_id_preserved(self, tmp_path):
+        captured: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "ok"}}]},
+            )
+
+        rt = _runtime(handler)
+        run(rt.run(_task(model="grok-4-fast"), _ctx(tmp_path)))
+        assert captured[0]["model"] == "grok-4-fast"
+        assert resolve_provider_model("opus", "grok-4-fast") == "grok-4-fast"
+        assert resolve_provider_model("grok-4-fast", "other") == "grok-4-fast"

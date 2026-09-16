@@ -21,6 +21,15 @@ from hyperresearch.runtime.types import AgentResult, AgentTask, ResearchContext
 
 _TOOL_KEYS = frozenset({"tools", "tool_choice", "parallel_tool_calls", "functions", "function_call"})
 _TOOL_FEATURES = frozenset({"tools", "tool_calls", "function_calling", "functions"})
+# Upstream profile fields are Claude Code aliases, not provider ids.
+_ROLE_ALIASES = frozenset({"haiku", "sonnet", "opus", "default"})
+
+
+def resolve_provider_model(requested: str | None, default_model: str) -> str:
+    name = (requested or "").strip()
+    if not name or name in _ROLE_ALIASES:
+        return default_model
+    return name
 
 
 def capabilities_require_tools(capabilities: dict[str, Any] | None) -> bool:
@@ -104,8 +113,9 @@ class ModelRuntime:
         return headers
 
     def _body(self, task: AgentTask) -> dict[str, Any]:
+        model = resolve_provider_model(task.model, self.default_model)
         body: dict[str, Any] = {
-            "model": task.model or self.default_model,
+            "model": model,
             "messages": [{"role": "user", "content": task.payload}],
         }
         if task.output_schema is not None:
@@ -150,7 +160,7 @@ class ModelRuntime:
             text=text,
             structured=structured,
             usage=dict(usage),
-            requested_model=task.model or self.default_model,
+            requested_model=resolve_provider_model(task.model, self.default_model),
             reported_model=reported_model,
             actual_model=None,
             runtime_metadata={"id": data.get("id"), "host": urlparse(url).netloc},

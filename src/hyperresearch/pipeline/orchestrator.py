@@ -9,15 +9,16 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from hyperresearch.core.citecheck import write_pairs_file
 from hyperresearch.core.profiles import resolve_profile
 from hyperresearch.core.runs import (
     init_run,
     load_manifest,
-    resume_position,
     set_status,
     set_step,
     verify_run,
 )
+from hyperresearch.core.vault import Vault
 from hyperresearch.pipeline.checkpoints import UNCERTAIN_REMOTE, TaskLog
 from hyperresearch.pipeline.host_actions import (
     HostBudget,
@@ -38,6 +39,8 @@ LIGHT_STEPS = ("1", "2", "10", "15", "16")
 FULL_STEPS = ("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "14.5", "15", "16")
 _INVESTIGATE = ("search", "fetch", "evidence_read", "complete")
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
+CITE_FINDINGS = "cite-check-findings.json"
+EVIDENCE_DIGEST = "evidence-digest.md"
 
 
 def mint_run_tag(query: str) -> str:
@@ -47,15 +50,17 @@ def mint_run_tag(query: str) -> str:
     return f"{slug}-{uuid.uuid4().hex[:8]}"
 
 
-def report_path(vault, tag: str) -> Path:
+def report_path(vault: Vault, tag: str) -> Path:
     return vault.root / "research" / "notes" / f"final_report_{tag}.md"
 
 
-def task_log_for(vault, tag: str) -> TaskLog:
+def task_log_for(vault: Vault, tag: str) -> TaskLog:
     return TaskLog(vault.run_dir(tag) / "task_log.jsonl")
 
 
-def context_for(vault, tag: str, runtime_name: str, query: str, profile: str, tier: str) -> ResearchContext:
+def context_for(
+    vault: Vault, tag: str, runtime_name: str, query: str, profile: str, tier: str
+) -> ResearchContext:
     return ResearchContext(
         run_id=tag,
         canonical_query=query,
@@ -66,7 +71,7 @@ def context_for(vault, tag: str, runtime_name: str, query: str, profile: str, ti
     )
 
 
-def _query_text(vault, tag: str, fallback: str = "") -> str:
+def _query_text(vault: Vault, tag: str, fallback: str = "") -> str:
     qpath = vault.run_dir(tag) / "query.md"
     if qpath.exists():
         return qpath.read_text(encoding="utf-8-sig")
@@ -106,8 +111,9 @@ async def run_many_retry(
     pending = [t for t in tasks if not log.is_success(t.task_id)]
     for t in tasks:
         if log.is_success(t.task_id):
-            rec = log.get(t.task_id)
-            results[t.task_id] = AgentResult(text=(rec.result or {}).get("text", ""), requested_model=t.model)
+            results[t.task_id] = AgentResult(
+                text=log.result_text(t.task_id), requested_model=t.model
+            )
 
     sem = asyncio.Semaphore(max(1, concurrency))
     failed: list[AgentTask] = []
@@ -115,8 +121,9 @@ async def run_many_retry(
     async def one(t: AgentTask) -> None:
         decision = log.resume_model(t.task_id)
         if decision == "skip":
-            rec = log.get(t.task_id)
-            results[t.task_id] = AgentResult(text=(rec.result or {}).get("text", ""), requested_model=t.model)
+            results[t.task_id] = AgentResult(
+                text=log.result_text(t.task_id), requested_model=t.model
+            )
             return
         if decision == UNCERTAIN_REMOTE:
             raise RuntimeError(f"uncertain_remote:{t.task_id}")
@@ -143,12 +150,50 @@ async def run_many_retry(
     return [results[t.task_id] for t in tasks]
 
 
-def _invalidate_gates(manifest: dict[str, Any]) -> None:
-    manifest["gates"] = {}
+def _file_hash(path: Path) -> str:
+    if not path.exists():
+        return ""
+    return content_hash(path.read_text(encoding="utf-8-sig"))
 
 
-def _well_formed_fallback_report() -> str:
-    return "## Findings\n\n" + ("Substantive sentence with real evidence attached [[src-note]]. " * 80)
+def _report_hash(vault: Vault, tag: str) -> str:
+    return _file_hash(report_path(vault, tag))
+
+
+def _evidence_hash(vault: Vault, tag: str) -> str:
+    return _file_hash(vault.run_dir(tag) / EVIDENCE_DIGEST)
+
+
+def _write_cite_findings(vault: Vault, tag: str, raw: str) -> None:
+    try:
+        data: Any = json.loads(raw) if raw.strip() else {"findings": []}
+    except json.JSONDecodeError:
+        data = {"findings": []}
+    if isinstance(data, list):
+        data = {"findings": data}
+    if not isinstance(data, dict):
+        data = {"findings": []}
+    data["report_hash"] = _report_hash(vault, tag)
+    data["evidence_hash"] = _evidence_hash(vault, tag)
+    (vault.run_dir(tag) / CITE_FINDINGS).write_text(
+        json.dumps(data, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def _cite_check_bound(vault: Vault, tag: str) -> bool:
+    path = vault.run_dir(tag) / CITE_FINDINGS
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    return (
+        data.get("report_hash") == _report_hash(vault, tag)
+        and data.get("evidence_hash") == _evidence_hash(vault, tag)
+    )
 
 
 async def _model(
@@ -159,14 +204,40 @@ async def _model(
 ) -> AgentResult:
     decision = log.resume_model(task.task_id)
     if decision == "skip":
-        rec = log.get(task.task_id)
-        return AgentResult(text=(rec.result or {}).get("text", ""), requested_model=task.model)
+        return AgentResult(text=log.result_text(task.task_id), requested_model=task.model)
     if decision == UNCERTAIN_REMOTE:
         raise RuntimeError(f"uncertain_remote:{task.task_id}")
     log.begin(task.task_id, "model", {"role": task.role})
     result = await runtime.run(task, context)
     log.succeed(task.task_id, {"text": result.text[:2000]})
     return result
+
+
+async def _run_cite_check(
+    vault: Vault,
+    tag: str,
+    runtime: AgentRuntime,
+    context: ResearchContext,
+    log: TaskLog,
+    model: str,
+    task_id: str,
+) -> None:
+    path = report_path(vault, tag)
+    if path.exists():
+        write_pairs_file(vault, tag, path)
+    result = await _model(
+        runtime,
+        context,
+        log,
+        AgentTask(
+            task_id=task_id,
+            role="cite_checker",
+            payload=context.canonical_query,
+            model=model,
+            allowed_actions=(),
+        ),
+    )
+    _write_cite_findings(vault, tag, result.text)
 
 
 def _maybe_patches(result: AgentResult, current_hash: str) -> PatchSet | None:
@@ -180,17 +251,20 @@ def _maybe_patches(result: AgentResult, current_hash: str) -> PatchSet | None:
     for item in ops_raw:
         if not isinstance(item, dict):
             continue
-        ops.append(PatchOp(
-            old_text=str(item.get("old_text") or ""),
-            new_text=str(item.get("new_text") or ""),
-            occurrence=item.get("occurrence"),
-            path=str(item.get("path") or ""),
-        ))
+        occ = item.get("occurrence")
+        ops.append(
+            PatchOp(
+                old_text=str(item.get("old_text") or ""),
+                new_text=str(item.get("new_text") or ""),
+                occurrence=int(occ) if occ is not None else None,
+                path=str(item.get("path") or ""),
+            )
+        )
     base = str(structured.get("base_report_hash") or current_hash)
     return PatchSet(base_report_hash=base, ops=tuple(ops))
 
 
-def _assert_no_chrome(vault, tag: str) -> None:
+def _assert_no_chrome(vault: Vault, tag: str) -> None:
     try:
         from hyperresearch.core.escalation import queue_stats
 
@@ -205,7 +279,7 @@ def _assert_no_chrome(vault, tag: str) -> None:
 
 
 async def execute_step(
-    vault,
+    vault: Vault,
     tag: str,
     step: str,
     runtime: AgentRuntime,
@@ -218,22 +292,25 @@ async def execute_step(
     run_dir = vault.run_dir(tag)
     model = "default"
     try:
-        from hyperresearch.core.profiles import resolve_profile
-
         profile = resolve_profile(context.profile, vault.config_path)
         model = profile.models.synthesizer
     except Exception:
         pass
 
     if step == "1":
-        result = await _model(runtime, context, log, AgentTask(
-            task_id="step-1",
-            role="decompose",
-            payload=context.canonical_query,
-            model=model,
-            output_schema=dict,
-            allowed_actions=(),
-        ))
+        result = await _model(
+            runtime,
+            context,
+            log,
+            AgentTask(
+                task_id="step-1",
+                role="decompose",
+                payload=context.canonical_query,
+                model=model,
+                output_schema=dict,
+                allowed_actions=(),
+            ),
+        )
         data = result.structured if isinstance(result.structured, dict) else json.loads(result.text)
         if "pipeline_tier" not in data:
             data["pipeline_tier"] = context.tier
@@ -262,30 +339,47 @@ async def execute_step(
         )
     elif step in {"10", "11"}:
         role = "draft" if step == "10" else "synthesizer"
-        result = await _model(runtime, context, log, AgentTask(
-            task_id=f"step-{step}",
-            role=role,
-            payload=context.canonical_query,
-            model=model,
-            allowed_actions=(),
-        ))
-        text = result.text.strip() or _well_formed_fallback_report()
+        result = await _model(
+            runtime,
+            context,
+            log,
+            AgentTask(
+                task_id=f"step-{step}",
+                role=role,
+                payload=context.canonical_query,
+                model=model,
+                allowed_actions=(),
+            ),
+        )
+        text = result.text.strip()
+        if not text:
+            set_status(vault, tag, "blocked", blocked_on="empty-draft")
+            set_step(vault, tag, step, "done")
+            return
         path = report_path(vault, tag)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
-        _invalidate_gates(load_manifest(vault, tag))
     elif step in {"3", "4", "6", "7", "9", "12"}:
         role = {
-            "3": "contradiction", "4": "loci", "6": "reconcile",
-            "7": "tensions", "9": "digest", "12": "critic",
+            "3": "contradiction",
+            "4": "loci",
+            "6": "reconcile",
+            "7": "tensions",
+            "9": "digest",
+            "12": "critic",
         }[step]
-        result = await _model(runtime, context, log, AgentTask(
-            task_id=f"step-{step}",
-            role=role,
-            payload=context.canonical_query,
-            model=model,
-            allowed_actions=(),
-        ))
+        result = await _model(
+            runtime,
+            context,
+            log,
+            AgentTask(
+                task_id=f"step-{step}",
+                role=role,
+                payload=context.canonical_query,
+                model=model,
+                allowed_actions=(),
+            ),
+        )
         artifact = {
             "3": "contradiction-graph.md",
             "4": "loci.json",
@@ -309,14 +403,19 @@ async def execute_step(
     elif step == "14":
         path = report_path(vault, tag)
         current = path.read_text(encoding="utf-8-sig") if path.exists() else ""
-        result = await _model(runtime, context, log, AgentTask(
-            task_id="step-14",
-            role="patcher",
-            payload=context.canonical_query,
-            model=model,
-            output_schema=dict,
-            allowed_actions=(),
-        ))
+        result = await _model(
+            runtime,
+            context,
+            log,
+            AgentTask(
+                task_id="step-14",
+                role="patcher",
+                payload=context.canonical_query,
+                model=model,
+                output_schema=dict,
+                allowed_actions=(),
+            ),
+        )
         patch_set = _maybe_patches(result, content_hash(current))
         if patch_set:
             apply_patch_set(
@@ -327,35 +426,26 @@ async def execute_step(
                 task_id="step-14-apply",
                 log=log,
             )
-            _invalidate_gates(load_manifest(vault, tag))
         (run_dir / "patch-log.json").write_text(result.text or "[]", encoding="utf-8")
     elif step == "14.5":
-        from hyperresearch.core.citecheck import write_pairs_file
-
-        path = report_path(vault, tag)
-        write_pairs_file(vault, tag, path)
-        result = await _model(runtime, context, log, AgentTask(
-            task_id="step-14.5",
-            role="cite_checker",
-            payload=context.canonical_query,
-            model=model,
-            allowed_actions=(),
-        ))
-        findings_path = run_dir / "cite-check-findings.json"
-        if not findings_path.exists():
-            findings_path.write_text(result.text or '{"findings": []}', encoding="utf-8")
+        await _run_cite_check(vault, tag, runtime, context, log, model, "step-14.5")
     elif step in {"15", "16"}:
         path = report_path(vault, tag)
-        before = content_hash(path.read_text(encoding="utf-8-sig")) if path.exists() else ""
+        before = _file_hash(path)
         role = "polish" if step == "15" else "readability"
-        result = await _model(runtime, context, log, AgentTask(
-            task_id=f"step-{step}",
-            role=role,
-            payload=context.canonical_query,
-            model=model,
-            output_schema=dict,
-            allowed_actions=(),
-        ))
+        result = await _model(
+            runtime,
+            context,
+            log,
+            AgentTask(
+                task_id=f"step-{step}",
+                role=role,
+                payload=context.canonical_query,
+                model=model,
+                output_schema=dict,
+                allowed_actions=(),
+            ),
+        )
         patch_set = _maybe_patches(result, before)
         if patch_set:
             apply_patch_set(
@@ -366,20 +456,26 @@ async def execute_step(
                 task_id=f"step-{step}-apply",
                 log=log,
             )
-        after = content_hash(path.read_text(encoding="utf-8-sig")) if path.exists() else ""
-        if after != before:
-            _invalidate_gates(load_manifest(vault, tag))
+        after = _file_hash(path)
+        if after != before and context.tier != "light":
+            await _run_cite_check(
+                vault, tag, runtime, context, log, model, f"cite-check-{after[:16]}"
+            )
         if step == "15":
-            (run_dir / "polish-log.json").write_text(result.text or '{"applied": []}', encoding="utf-8")
+            (run_dir / "polish-log.json").write_text(
+                result.text or '{"applied": []}', encoding="utf-8"
+            )
         else:
-            (run_dir / "readability-log.json").write_text(result.text or '{"applied": []}', encoding="utf-8")
+            (run_dir / "readability-log.json").write_text(
+                result.text or '{"applied": []}', encoding="utf-8"
+            )
     else:
         raise BrowserUnsupported(f"step {step} is not implemented as a host step")
 
     set_step(vault, tag, step, "done")
 
 
-def _ship(vault, tag: str, tier: str) -> dict[str, Any]:
+def _ship(vault: Vault, tag: str, tier: str) -> dict[str, Any]:
     result = verify_run(vault, tag)
     if not result["passed"]:
         set_status(vault, tag, "blocked", blocked_on="verify")
@@ -390,19 +486,28 @@ def _ship(vault, tag: str, tier: str) -> dict[str, Any]:
     from hyperresearch.core.independence import compute_independence
 
     compute_independence(vault, tag)
-    cc = vault.run_dir(tag) / "cite-check-findings.json"
-    if not cc.exists():
+    if not _cite_check_bound(vault, tag):
         set_status(vault, tag, "blocked", blocked_on="cite-check")
-        result = dict(result)
-        result["passed"] = False
-        result["checks"] = [*result["checks"], {"name": "cite-check-final", "ok": False, "detail": "missing"}]
-        return result
+        failed = dict(result)
+        failed["passed"] = False
+        failed["checks"] = [
+            *result["checks"],
+            {
+                "name": "cite-check-final",
+                "ok": False,
+                "detail": (
+                    f"unbound report={_report_hash(vault, tag)[:12]} "
+                    f"evidence={_evidence_hash(vault, tag)[:12]}"
+                ),
+            },
+        ]
+        return failed
     set_status(vault, tag, "verified")
     return result
 
 
 async def execute_run(
-    vault,
+    vault: Vault,
     query: str,
     runtime: AgentRuntime,
     *,
@@ -414,13 +519,14 @@ async def execute_run(
     if resume:
         if not tag:
             raise ValueError("resume requires a run tag")
-        manifest = load_manifest(vault, tag)
-        query = _query_text(vault, tag, query)
+        run_tag = tag
+        manifest = load_manifest(vault, run_tag)
+        query = _query_text(vault, run_tag, query)
     else:
-        tag = tag or mint_run_tag(query)
-        manifest = init_run(vault, tag, profile=profile, budget_usd=budget_usd, query=query)
+        run_tag = tag or mint_run_tag(query)
+        manifest = init_run(vault, run_tag, profile=profile, budget_usd=budget_usd, query=query)
 
-    run_dir = vault.run_dir(tag)
+    run_dir = vault.run_dir(run_tag)
     qpath = run_dir / "query.md"
     if not qpath.exists():
         qpath.write_text(query, encoding="utf-8")
@@ -429,48 +535,41 @@ async def execute_run(
     tier = _declared_tier(run_dir, "light" if profile == "light" else "full")
     if profile == "light":
         tier = _declared_tier(run_dir, "light")
-    context = context_for(vault, tag, runtime.name, query, profile, tier)
-    log = task_log_for(vault, tag)
+    context = context_for(vault, run_tag, runtime.name, query, profile, tier)
+    log = task_log_for(vault, run_tag)
     resolved = resolve_profile(profile, vault.config_path)
     budget = budget_from_profile(resolved, manifest)
     executor = HostExecutor(vault=vault, workspace_root=vault.root)
 
-    steps = step_ids_for(tier if (run_dir / "prompt-decomposition.json").exists() else (
-        "light" if profile == "light" else "full"
-    ), profile, vault.config_path)
-
-    # After step 1, re-read declared tier.
-    pos = resume_position(manifest)
-    remaining = list(pos["remaining_steps"])
-    if not remaining:
-        remaining = [s for s in steps if manifest.get("steps", {}).get(s, {}).get("status") not in ("done", "skipped")]
-
-    # Prefer the host graph over profile_steps when they disagree (light/full).
-    ordered = [s for s in steps if s in remaining or s not in manifest.get("steps", {})]
-    if not ordered:
-        ordered = remaining
+    steps = step_ids_for(
+        tier if (run_dir / "prompt-decomposition.json").exists() else (
+            "light" if profile == "light" else "full"
+        ),
+        profile,
+        vault.config_path,
+    )
 
     for step in steps:
-        status = load_manifest(vault, tag).get("steps", {}).get(step, {}).get("status")
+        live = load_manifest(vault, run_tag)
+        if live.get("status") == "blocked":
+            break
+        status = live.get("steps", {}).get(step, {}).get("status")
         if status in ("done", "skipped"):
             continue
-        await execute_step(vault, tag, step, runtime, context, log, executor, budget)
+        await execute_step(vault, run_tag, step, runtime, context, log, executor, budget)
+        if load_manifest(vault, run_tag).get("status") == "blocked":
+            break
         if step == "1":
             tier = _declared_tier(run_dir, tier)
-            context = context_for(vault, tag, runtime.name, query, profile, tier)
+            context = context_for(vault, run_tag, runtime.name, query, profile, tier)
             steps = step_ids_for(tier, profile, vault.config_path)
 
-    path = report_path(vault, tag)
-    before_hash = content_hash(path.read_text(encoding="utf-8-sig")) if path.exists() else ""
-    result = _ship(vault, tag, context.tier)
-    after_hash = content_hash(path.read_text(encoding="utf-8-sig")) if path.exists() else ""
-    if after_hash != before_hash:
-        result = _ship(vault, tag, context.tier)
-    manifest = load_manifest(vault, tag)
-    return {"manifest": manifest, "verify": result, "tag": tag}
+    result = _ship(vault, run_tag, context.tier)
+    manifest = load_manifest(vault, run_tag)
+    return {"manifest": manifest, "verify": result, "tag": run_tag}
 
 
-async def resume_run(vault, tag: str, runtime: AgentRuntime) -> dict[str, Any]:
+async def resume_run(vault: Vault, tag: str, runtime: AgentRuntime) -> dict[str, Any]:
     query = _query_text(vault, tag)
     profile = load_manifest(vault, tag).get("profile", "light")
     return await execute_run(vault, query, runtime, profile=profile, tag=tag, resume=True)

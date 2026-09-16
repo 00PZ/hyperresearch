@@ -137,7 +137,7 @@ class AgentRuntime(Protocol):
     ) -> list[AgentResult]: ...
 ```
 
-- **Host-action loop** (investigator/fetcher-style roles): repeat until `complete` or budget exhausted: model returns structured `HostAction`s → host validates (policy, workspace, caps) → host executes search/fetch/evidence_read using core → host appends provenance-bearing results to the next payload → next `AgentTask` with same role and new `task_id`. Critics/patch/polish roles have `allowed_actions=()`. Iteration, time, and cost limits come from the active profile/levers, not from ad-hoc constants.
+- **Host-action loop** (investigator/fetcher-style roles): repeat until `complete` or budget exhausted: model returns structured `HostAction`s → host validates (policy, workspace, caps) → host executes search/fetch/evidence_read using core → host appends provenance-bearing results to the next payload → next `AgentTask` with same role and new `task_id`. Critics/patch/polish roles have `allowed_actions=()`. Iteration, time, and cost limits come from the active profile/levers that **mean** those quantities (spend ceiling, investigator caps, explicit time budget). Do not map `vault_check_interval_s` (or any unrelated interval) to wall-clock.
 - **Isolation is preventive:** ModelRuntime never offers tools. Host actions are the only way to touch the network or disk. Observation-and-stop of a tool-enabled agent is not isolation.
 - omp is not an AgentRuntime. Peer-gateway and Paperclip are not research backends.
 - Model id and provider from profile config, sent as request fields. Do not treat `status.model` / echoed request fields as `actual_model`.
@@ -145,9 +145,10 @@ class AgentRuntime(Protocol):
 - **Host-action crash window:** a fetch/patch/vault write may succeed on disk before the success checkpoint is written. Each host action must be **idempotent** (same `task_id` + args yields the same persisted effect) **or** resume must **reconcile** observed state (content hash, vault note id, evidence snapshot) before replay. Cumulative patch-byte/hunk counters are part of the checkpoint and must survive resume. Do not replay a patch set whose `base_report_hash` no longer matches.
 - `run_many`: retry only failed members.
 - **Light vs full (final artifacts)**
-  - Any mutation of the report or of the evidence snapshot **invalidates** the corresponding gate. Terminal success is assigned only after gates run on the artifacts that will be kept.
+  - Any mutation of the report or of the evidence snapshot **invalidates** the corresponding gate. Invalidation is a **persisted** manifest/checkpoint write, or the gate is re-run on the files that will be kept. Mutating a loaded dict in memory is not invalidation.
+  - Empty or whitespace-only model output for a draft/synthesis step is a **blocked-run**. The host does not invent a Findings body, citations, or `[[src-note]]` stand-in so ship-check can pass.
   - Light: upstream light steps, then **ship check on the final report**. State `completed`. Not `verified`.
-  - Full: upstream full graph, then **ship check on the final report**, **independence on the final evidence snapshot**, **cite-check on `(final report hash, final evidence snapshot)`**. State `verified` only when all three pass on those finals.
+  - Full: upstream full graph, then **ship check on the final report**, **independence on the final evidence snapshot**, **cite-check on `(final report hash, final evidence snapshot)`**. State `verified` only when all three pass on those finals. Presence of `cite-check-findings.json` is not that gate.
   - Order: synthesis → critics → (optional gap-fetch) → patch → cite-check → polish → readability. If polish or readability changes the report hash, re-run ship-check and cite-check on the new hash (and independence if the evidence snapshot also changed). Failed ship check, independence, or cite-check → upstream **blocked-run** behaviour, not `completed`/`verified`.
 - **Patch apply:** `base_report_hash`; unique `old_text` or `occurrence`; atomic set; per-hunk, per-set, and **cumulative** caps across patch + cite-check second pass + polish + readability. Exceeding cumulative cap → `blocked` / structural escalation. Canonical query and evidence files immutable in late stage.
 - Workspace on the workstation, from config, never from model output. Path traversal rejected.
@@ -177,10 +178,11 @@ Good tests assert external behaviour: step transitions, manifest fields, `comple
 - Host-action loop: propose → validate → execute → provenance round-trip; illegal action rejected; budget stop.
 - Crash after persistent effect, before checkpoint: replay is a no-op or reconciles; cumulative patch counters unchanged except for the reconciled action; `base_report_hash` mismatch does not apply a second patch.
 - Patch safety: allow; reject path/size/full replace/missing old_text/non-unique old_text; stale hash; cumulative-cap bypass; atomic rollback.
-- Light fixture: ship check on **final** report pass → `completed`, never `verified`. Light fixture: ship check fail → blocked. Light fixture: polish after a passing ship-check that changes the report → ship-check runs again.
-- Full fixture: ship + independence + cite-check on **final** report and **final** evidence snapshot; polish that changes hash → ship-check and cite-check again (independence if evidence changed) → `verified`.
+- Light fixture: ship check on **final** report pass → `completed`, never `verified`. Light fixture: ship check fail → blocked. Light fixture: polish after a passing ship-check that changes the report → ship-check runs again. Light fixture: empty draft → blocked, and the report file is not a host-authored cited body.
+- Full fixture: ship + independence + cite-check on **final** report and **final** evidence snapshot; polish that changes hash → ship-check and cite-check again (independence if evidence changed) → `verified`. Existence of `cite-check-findings.json` alone must not yield `verified`.
 - Resume: completed `task_id`s not replayed; `uncertain_remote` does not auto-POST; `run_many` retries only the failed member.
 - No-Claude static gate.
+- `ruff check` and `mypy src/hyperresearch/` (strict, as in upstream CONTRIBUTING) on `runtime/` and `pipeline/`. A sitting that only greened its own pytest files is not mergeable.
 - Live ModelRuntime light + full: documented commands, not default pytest. Both required before Spec 1 is done.
 
 ## Out of Scope

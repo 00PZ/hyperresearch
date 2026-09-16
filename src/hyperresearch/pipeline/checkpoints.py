@@ -55,6 +55,18 @@ class TaskLog:
         rec = self._by_id.get(task_id)
         return rec is not None and rec.status == TERMINAL_SUCCESS
 
+    def result_payload(self, task_id: str) -> dict[str, Any] | None:
+        rec = self.get(task_id)
+        return None if rec is None else rec.result
+
+    def result_text(self, task_id: str) -> str:
+        payload = self.result_payload(task_id)
+        if not payload:
+            return ""
+        text = payload.get("text", "")
+        return text if isinstance(text, str) else ""
+
+
     def _append(self, rec: TaskRecord) -> None:
         self._by_id[rec.task_id] = rec
         self.path.parent.mkdir(parents=True, exist_ok=True)

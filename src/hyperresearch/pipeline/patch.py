@@ -6,6 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from hyperresearch.pipeline.checkpoints import TaskLog
 
@@ -23,7 +24,7 @@ class PatchError(Exception):
     """Patch rejected. Report unchanged."""
 
 
-class StructuralEscalation(PatchError):
+class StructuralEscalationError(PatchError):
     """Critic asked for more than a surgical patch. Block; do not regenerate."""
 
 
@@ -56,7 +57,7 @@ class PatchState:
     cumulative_hunks: int = 0
     last_report_hash: str = ""
 
-    def to_json(self) -> dict:
+    def to_json(self) -> dict[str, Any]:
         return {
             "cumulative_bytes": self.cumulative_bytes,
             "cumulative_hunks": self.cumulative_hunks,
@@ -130,16 +131,16 @@ def apply_patch_set(
     policy: PatchPolicy | None = None,
     task_id: str = "patch",
     log: TaskLog | None = None,
-) -> dict:
+) -> dict[str, Any]:
     policy = policy or PatchPolicy()
     if log is not None and log.is_success(task_id):
-        rec = log.get(task_id)
-        return rec.result or {"ok": True, "reconciled": True, "skipped": True}
+        payload = log.result_payload(task_id)
+        return payload or {"ok": True, "reconciled": True, "skipped": True}
 
     if not patch_set.ops:
         raise PatchError("empty patch set")
     if len(patch_set.ops) > policy.max_ops:
-        raise StructuralEscalation(f"too many ops: {len(patch_set.ops)} > {policy.max_ops}")
+        raise StructuralEscalationError(f"too many ops: {len(patch_set.ops)} > {policy.max_ops}")
 
     for op in patch_set.ops:
         name = Path(op.path).name if op.path else report_path.name
@@ -153,13 +154,13 @@ def apply_patch_set(
                 raise PatchError(f"wrong path {op.path}")
         hunk = _hunk_bytes(op)
         if hunk > policy.max_hunk_bytes:
-            raise StructuralEscalation(f"hunk too large: {hunk} > {policy.max_hunk_bytes}")
+            raise StructuralEscalationError(f"hunk too large: {hunk} > {policy.max_hunk_bytes}")
         if not op.old_text.strip() and op.new_text:
-            raise StructuralEscalation("full replace is not a surgical patch")
+            raise StructuralEscalationError("full replace is not a surgical patch")
 
     set_bytes = sum(_hunk_bytes(op) for op in patch_set.ops)
     if set_bytes > policy.max_set_bytes:
-        raise StructuralEscalation(f"set too large: {set_bytes} > {policy.max_set_bytes}")
+        raise StructuralEscalationError(f"set too large: {set_bytes} > {policy.max_set_bytes}")
 
     current = report_path.read_text(encoding="utf-8-sig") if report_path.exists() else ""
     current_hash = content_hash(current)
@@ -179,11 +180,11 @@ def apply_patch_set(
 
     state = PatchState.load(state_path)
     if state.cumulative_bytes + set_bytes > policy.max_cumulative_bytes:
-        raise StructuralEscalation(
+        raise StructuralEscalationError(
             f"cumulative byte cap: {state.cumulative_bytes + set_bytes} > {policy.max_cumulative_bytes}"
         )
     if state.cumulative_hunks + len(patch_set.ops) > policy.max_cumulative_hunks:
-        raise StructuralEscalation("cumulative hunk cap exceeded")
+        raise StructuralEscalationError("cumulative hunk cap exceeded")
 
     assert intended is not None and intended_hash is not None
     if log is not None:

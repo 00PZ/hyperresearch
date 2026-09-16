@@ -104,3 +104,13 @@ def test_light_polish_that_changes_report_reruns_ship_check(tmp_vault):
     assert result["verify"]["passed"] is True
     assert load_manifest(tmp_vault, "lt-03")["status"] == "completed"
     assert verify_run(tmp_vault, "lt-03")["passed"] is True
+
+
+def test_empty_draft_blocks_without_host_cited_body(tmp_vault):
+    result = run(execute_run(tmp_vault, "What is X?", _rt(draft="  \n  "), profile="light", tag="lt-empty"))
+    assert result["manifest"]["status"] == "blocked"
+    path = report_path(tmp_vault, "lt-empty")
+    body = path.read_text(encoding="utf-8") if path.exists() else ""
+    assert "[[src-note]]" not in body
+    assert "## Findings" not in body
+

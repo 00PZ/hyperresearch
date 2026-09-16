@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from hyperresearch.core.profiles import Profile
+from hyperresearch.core.vault import Vault
 from hyperresearch.pipeline.checkpoints import TaskLog
 from hyperresearch.runtime.errors import IllegalHostAction
 from hyperresearch.runtime.parse import assert_action_allowed, iter_host_actions
@@ -33,19 +35,21 @@ class HostBudget:
     max_cost_usd: float
 
 
-def budget_from_profile(profile: Any, manifest: dict[str, Any]) -> HostBudget:
+def budget_from_profile(profile: Profile, manifest: dict[str, Any]) -> HostBudget:
     cost = manifest.get("budget_usd")
     max_cost = float(cost) if cost is not None else float("inf")
+    time_s = manifest.get("time_budget_s")
+    max_seconds = float(time_s) if time_s is not None else float("inf")
     return HostBudget(
         max_iterations=max(1, int(profile.investigator_max)),
-        max_seconds=float(profile.vault_check_interval_s) * 60.0,
+        max_seconds=max_seconds,
         max_cost_usd=max_cost,
     )
 
 
 @dataclass
 class HostExecutor:
-    vault: Any
+    vault: Vault
     workspace_root: Path
     search_fn: Callable[..., Any] | None = None
     fetch_fn: Callable[..., Any] | None = None
@@ -219,8 +223,7 @@ async def run_host_action_loop(
         if log is not None:
             decision = log.resume_model(model_id)
             if decision == "skip":
-                rec = log.get(model_id)
-                last = AgentResult(text=(rec.result or {}).get("text", ""), requested_model=task.model)
+                last = AgentResult(text=log.result_text(model_id), requested_model=task.model)
                 continue
             if decision == "uncertain_remote":
                 raise RuntimeError(f"uncertain_remote:{model_id}")
@@ -246,8 +249,8 @@ async def run_host_action_loop(
             assert_action_allowed(action, task.allowed_actions)
             ha_id = f"{prefix}-ha-{i}-{j}"
             if log is not None and log.is_success(ha_id):
-                rec = log.get(ha_id)
-                provenance.append(rec.result or {"task_id": ha_id, "ok": True, "reconciled": True})
+                rec_result = log.result_payload(ha_id)
+                provenance.append(rec_result or {"task_id": ha_id, "ok": True, "reconciled": True})
                 if action.kind == "complete":
                     stop = True
                 continue

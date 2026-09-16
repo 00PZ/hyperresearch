@@ -10,7 +10,7 @@ from hyperresearch.pipeline.patch import (
     PatchOp,
     PatchPolicy,
     PatchSet,
-    StructuralEscalation,
+    StructuralEscalationError,
     apply_patch_set,
     content_hash,
 )
@@ -126,7 +126,7 @@ def test_cumulative_cap_bypass_blocked(tmp_vault):
         policy=policy,
     )
     h2 = content_hash(path.read_text(encoding="utf-8"))
-    with pytest.raises(StructuralEscalation, match="cumulative"):
+    with pytest.raises(StructuralEscalationError, match="cumulative"):
         apply_patch_set(
             path,
             PatchSet(base_report_hash=h2, ops=(PatchOp("bbbb", "BBBB"),)),

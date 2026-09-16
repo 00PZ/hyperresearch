@@ -12,7 +12,7 @@ from hyperresearch.pipeline.patch import (
     PatchOp,
     PatchPolicy,
     PatchSet,
-    StructuralEscalation,
+    StructuralEscalationError,
     apply_patch_set,
 )
 
@@ -23,7 +23,7 @@ __all__ = [
     "PatchOp",
     "PatchPolicy",
     "PatchSet",
-    "StructuralEscalation",
+    "StructuralEscalationError",
     "apply_patch_set",
     "budget_from_profile",
     "execute_run",

@@ -7,29 +7,29 @@ class AgentRuntimeError(Exception):
     """Base for runtime-seam failures."""
 
 
-class RuntimeFailure(AgentRuntimeError):
+class RuntimeFailure(AgentRuntimeError):  # noqa: N818
     """Provider/runtime failed the call."""
 
 
-class RuntimeTimeout(AgentRuntimeError):
+class RuntimeTimeout(AgentRuntimeError):  # noqa: N818
     """Call exceeded the host timeout."""
 
 
-class MalformedStructuredOutput(AgentRuntimeError):
+class MalformedStructuredOutput(AgentRuntimeError):  # noqa: N818
     """output_schema was set and the payload could not be parsed/validated."""
 
 
-class UnexpectedToolResponse(AgentRuntimeError):
+class UnexpectedToolResponse(AgentRuntimeError):  # noqa: N818
     """Response contained tool_calls (or equivalent). Do not execute them."""
 
 
-class ToolsRequired(AgentRuntimeError):
+class ToolsRequired(AgentRuntimeError):  # noqa: N818
     """Config or advertised capabilities require tools. Refuse to start."""
 
 
-class IllegalHostAction(AgentRuntimeError):
+class IllegalHostAction(AgentRuntimeError):  # noqa: N818
     """Model proposed a host action the task/policy forbids."""
 
 
-class BrowserUnsupported(AgentRuntimeError):
+class BrowserUnsupported(AgentRuntimeError):  # noqa: N818
     """Claude-in-Chrome / browser-fetcher is unsupported in Spec 1."""

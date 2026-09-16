@@ -220,27 +220,24 @@ class TestModelRuntime:
         assert "tools" not in captured[0]
         assert "tool_choice" not in captured[0]
 
-    def test_readerror_after_post_is_uncertain_submission(self, tmp_path):
+    @pytest.mark.parametrize(
+        "factory, match",
+        [
+            (lambda: httpx.ReadError("connection reset after provider accepted request"), "connection reset"),
+            (lambda: httpx.RemoteProtocolError("peer closed connection"), "peer closed"),
+            (lambda: httpx.WriteError("broken pipe"), "broken pipe"),
+            (lambda: httpx.TransportError("generic transport failure"), "generic transport"),
+        ],
+    )
+    def test_unknown_transport_after_post_is_uncertain(self, tmp_path, factory, match):
         posts: list[int] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             posts.append(1)
-            raise httpx.ReadError("connection reset after provider accepted request")
+            raise factory()
 
         rt = _runtime(handler)
-        with pytest.raises(UncertainSubmission, match="connection reset"):
-            run(rt.run(_task(), _ctx(tmp_path)))
-        assert posts == [1]
-
-    def test_remote_protocol_error_is_uncertain_submission(self, tmp_path):
-        posts: list[int] = []
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            posts.append(1)
-            raise httpx.RemoteProtocolError("peer closed connection")
-
-        rt = _runtime(handler)
-        with pytest.raises(UncertainSubmission, match="peer closed"):
+        with pytest.raises(UncertainSubmission, match=match):
             run(rt.run(_task(), _ctx(tmp_path)))
         assert posts == [1]
 

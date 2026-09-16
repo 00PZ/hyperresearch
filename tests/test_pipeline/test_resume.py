@@ -150,6 +150,8 @@ def _model_runtime(handler) -> ModelRuntime:
     [
         lambda: httpx.ReadError("connection reset after provider accepted request"),
         lambda: httpx.RemoteProtocolError("peer closed connection"),
+        lambda: httpx.WriteError("broken pipe"),
+        lambda: httpx.TransportError("generic transport failure"),
     ],
 )
 def test_run_many_uncertain_transport_one_post(tmp_path, factory):
@@ -178,6 +180,37 @@ def test_run_many_uncertain_transport_one_post(tmp_path, factory):
     assert log.get("b") is not None
     assert log.get("b").status == UNCERTAIN_REMOTE
     assert log.is_success("a")
+    assert log.is_success("c")
+
+
+def test_run_many_connect_error_retries(tmp_path):
+    posts: list[str] = []
+    fail_once = True
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal fail_once
+        body = json.loads(request.content)
+        text = body["messages"][0]["content"]
+        posts.append(text)
+        if text == "B" and fail_once:
+            fail_once = False
+            raise httpx.ConnectError("connection refused")
+        return _ok_chat("ok")
+
+    rt = _model_runtime(handler)
+    log = TaskLog(tmp_path / "t.jsonl")
+    tasks = [
+        AgentTask(task_id="a", role="r", payload="A", model="m"),
+        AgentTask(task_id="b", role="r", payload="B", model="m"),
+        AgentTask(task_id="c", role="r", payload="C", model="m"),
+    ]
+    results = asyncio.run(run_many_retry(rt, tasks, _ctx(tmp_path), 3, log))
+    assert [r.text for r in results] == ["ok", "ok", "ok"]
+    assert posts.count("B") == 2
+    assert posts.count("A") == 1
+    assert posts.count("C") == 1
+    assert log.is_success("a")
+    assert log.is_success("b")
     assert log.is_success("c")
 
 

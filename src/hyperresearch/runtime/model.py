@@ -57,18 +57,13 @@ def chat_completions_url(base_url: str) -> str:
     return f"{base}/chat/completions"
 
 
-_UNCERTAIN_TRANSPORT = (httpx.ReadError, httpx.RemoteProtocolError)
-
-
 def classify_http_error(exc: httpx.HTTPError) -> RuntimeFailure | RuntimeTimeout | UncertainSubmission:
-    """Timeout vs uncertain submit vs known-safe failure."""
+    """Timeout vs known-safe pre-submit vs default uncertain."""
     if isinstance(exc, httpx.TimeoutException):
         return RuntimeTimeout(str(exc))
-    if isinstance(exc, _UNCERTAIN_TRANSPORT):
-        return UncertainSubmission(str(exc))
-    if "connection reset" in str(exc).lower():
-        return UncertainSubmission(str(exc))
-    return RuntimeFailure(str(exc))
+    if isinstance(exc, httpx.ConnectError):
+        return RuntimeFailure(str(exc))
+    return UncertainSubmission(str(exc))
 
 
 class ModelRuntime:

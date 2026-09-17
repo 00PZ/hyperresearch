@@ -1046,6 +1046,9 @@ async def execute_run(
             )
         except BudgetExhaustedError:
             break
+        except Exception:
+            set_status(vault, run_tag, "blocked", blocked_on="host-error")
+            raise
         if load_manifest(vault, run_tag).get("status") == "blocked":
             break
         if step == "1":

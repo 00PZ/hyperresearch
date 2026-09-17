@@ -199,3 +199,73 @@ def test_missing_actions_retries_then_complete(tmp_vault):
     ))
     assert result.text == "done"
     assert any("No host actions parsed" in t.payload for t in rt.calls[1:])
+
+
+def test_missing_note_read_returns_note_not_found(tmp_vault):
+    ex = HostExecutor(vault=tmp_vault, workspace_root=tmp_vault.root)
+    result = ex.execute(
+        HostAction(kind="evidence_read", args={"note_id": "world-mobile-airnodes"}, reason="x"),
+        task_id="t-missing",
+    )
+    assert result["ok"] is False
+    assert result["error"] == "note_not_found"
+    assert result["note_id"] == "world-mobile-airnodes"
+
+
+def test_missing_note_read_then_valid_action_continues(tmp_vault):
+    fetches: list[str] = []
+
+    def fetch_fn(url, tags=None):
+        fetches.append(url)
+        return {"note_id": "n1", "url": url}
+
+    (tmp_vault.notes_dir / "n1.md").write_text("# n1\nbody\n", encoding="utf-8")
+    script = {
+        "loop-model-0": AgentResult(
+            text="read missing",
+            structured={
+                "kind": "evidence_read",
+                "args": {"note_id": "world-mobile-airnodes"},
+                "reason": "guess",
+            },
+            requested_model="m",
+        ),
+        "loop-model-1": AgentResult(
+            text="fetch",
+            structured={
+                "kind": "fetch",
+                "args": {"url": "https://example.com/a"},
+                "reason": "recover",
+            },
+            requested_model="m",
+        ),
+        "loop-model-2": AgentResult(
+            text="done",
+            structured={"kind": "complete", "args": {}, "reason": "done"},
+            requested_model="m",
+        ),
+    }
+    rt = FakeRuntime(responses=script)
+    log = TaskLog(tmp_vault.root / "tl.jsonl")
+    result = run(run_host_action_loop(
+        rt,
+        AgentTask(
+            task_id="loop",
+            role="investigator",
+            payload="q",
+            model="m",
+            allowed_actions=("search", "fetch", "evidence_read", "complete"),
+        ),
+        _ctx(tmp_vault.root),
+        HostExecutor(vault=tmp_vault, workspace_root=tmp_vault.root, fetch_fn=fetch_fn),
+        HostBudget(max_iterations=8, max_seconds=30, max_cost_usd=10),
+        log,
+        task_id_prefix="loop",
+    ))
+    assert result.text == "done"
+    assert fetches == ["https://example.com/a"]
+    miss = log.result_payload("loop-ha-0-0")
+    assert miss is not None
+    assert miss.get("ok") is False
+    assert miss.get("error") == "note_not_found"
+    assert miss.get("note_id") == "world-mobile-airnodes"

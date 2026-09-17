@@ -337,7 +337,13 @@ class HostExecutor:
             except IllegalHostAction:
                 raise IllegalHostAction(f"note path escapes workspace: {note_id}")
         if not path.exists():
-            raise IllegalHostAction(f"no note file for {note_id}")
+            return {
+                "task_id": task_id,
+                "kind": "evidence_read",
+                "ok": False,
+                "error": "note_not_found",
+                "note_id": note_id,
+            }
         text = path.read_text(encoding="utf-8-sig")
         source = ""
         try:

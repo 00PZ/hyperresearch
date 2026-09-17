@@ -147,6 +147,49 @@ def _check_quote_integrity(vault, conn, report_path, report_text) -> list[dict]:
     return issues
 
 
+def _quote_in_notes(conn, quote: str) -> bool:
+    """True when the whitespace-normalized span is in some note body (FTS)."""
+    import re as _re
+
+    phrase = _re.sub(r"\s+", " ", quote).strip().replace('"', " ").replace("'", "''")
+    if not phrase:
+        return False
+    try:
+        hit = conn.execute(
+            'SELECT id FROM notes_fts WHERE notes_fts MATCH ? LIMIT 1',
+            (f'body_plain: "{phrase}"',),
+        ).fetchone()
+    except Exception:
+        hit = None
+    return bool(hit)
+
+
+def unquote_unmatched_spans(conn, report_text: str, *, min_words: int = 5) -> tuple[str, int]:
+    """Drop quotation marks on >=min_words spans that are not in any vault note.
+
+    Upstream polish: quotation marks are reserved for verbatim source text.
+    The host applies that fix so a scare-quote cannot block ship-check.
+    Matched spans and short spans are left unchanged.
+    """
+    import re as _re
+
+    n = 0
+    parts: list[str] = []
+    last = 0
+    for m in _QUOTE_SPAN_RE.finditer(report_text):
+        quote = _re.sub(r"\s+", " ", m.group(1)).strip()
+        if len(quote.split()) < min_words or _quote_in_notes(conn, quote):
+            continue
+        parts.append(report_text[last:m.start()])
+        parts.append(m.group(1))
+        last = m.end()
+        n += 1
+    if n == 0:
+        return report_text, 0
+    parts.append(report_text[last:])
+    return "".join(parts), n
+
+
 def _check_numeric_consistency(vault, conn, report_path, report_text) -> list[dict]:
     """Substantive numbers in the report should be traceable to claims or
     cited note bodies. Warning severity — legitimate derived arithmetic

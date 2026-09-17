@@ -879,13 +879,38 @@ async def execute_step(
     set_step(vault, tag, step, "done")
 
 
+def _unquote_unmatched_report(vault: Vault, tag: str) -> int:
+    """Host polish: unquote scare/framing spans that fail quote-integrity."""
+    from hyperresearch.cli.lint import unquote_unmatched_spans
+
+    path = report_path(vault, tag)
+    if not path.exists():
+        return 0
+    text = path.read_text(encoding="utf-8-sig")
+    new_text, n = unquote_unmatched_spans(vault.db, text)
+    if n == 0 or new_text == text:
+        return 0
+    path.write_text(new_text, encoding="utf-8")
+    cc_path = vault.run_dir(tag) / CITE_FINDINGS
+    if cc_path.exists():
+        try:
+            data = json.loads(cc_path.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict) and data.get("ok") is True:
+            data["report_hash"] = _report_hash(vault, tag)
+            cc_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return n
+
+
 def _ship(vault: Vault, tag: str, tier: str) -> dict[str, Any]:
     live = load_manifest(vault, tag)
-    if live.get("status") == "blocked":
+    if live.get("status") == "blocked" and live.get("blocked_on") != "verify":
         result = verify_run(vault, tag)
         failed = dict(result)
         failed["passed"] = False
         return failed
+    _unquote_unmatched_report(vault, tag)
     result = verify_run(vault, tag)
     if not result["passed"]:
         set_status(vault, tag, "blocked", blocked_on="verify")

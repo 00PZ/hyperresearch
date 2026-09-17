@@ -879,28 +879,44 @@ async def execute_step(
     set_step(vault, tag, step, "done")
 
 
-def _unquote_unmatched_report(vault: Vault, tag: str) -> int:
-    """Host polish: unquote scare/framing spans that fail quote-integrity."""
-    from hyperresearch.cli.lint import unquote_unmatched_spans
+def _invalidate_cite_check(vault: Vault, tag: str) -> None:
+    """A report mutation unbinds cite-check. Never restamp an old ok hash."""
+    cc_path = vault.run_dir(tag) / CITE_FINDINGS
+    if not cc_path.exists():
+        return
+    try:
+        data = json.loads(cc_path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError:
+        return
+    if not isinstance(data, dict):
+        return
+    data["ok"] = False
+    data["report_hash"] = ""
+    cc_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def _unquote_unmatched_report(vault: Vault, tag: str, log: TaskLog | None = None) -> int:
+    """Host patch: unquote unmatched spans; invalidate cite-check bind."""
+    from hyperresearch.cli.lint import unmatched_quote_ops
 
     path = report_path(vault, tag)
     if not path.exists():
         return 0
     text = path.read_text(encoding="utf-8-sig")
-    new_text, n = unquote_unmatched_spans(vault.db, text)
-    if n == 0 or new_text == text:
+    raw = unmatched_quote_ops(vault.db, text)
+    if not raw:
         return 0
-    path.write_text(new_text, encoding="utf-8")
-    cc_path = vault.run_dir(tag) / CITE_FINDINGS
-    if cc_path.exists():
-        try:
-            data = json.loads(cc_path.read_text(encoding="utf-8-sig"))
-        except json.JSONDecodeError:
-            data = None
-        if isinstance(data, dict) and data.get("ok") is True:
-            data["report_hash"] = _report_hash(vault, tag)
-            cc_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    return n
+    ops = tuple(PatchOp(old_text=old, new_text=new) for old, new in raw)
+    apply_patch_set(
+        path,
+        PatchSet(base_report_hash=content_hash(text), ops=ops),
+        workspace_root=vault.root,
+        state_path=vault.run_dir(tag) / "patch-state.json",
+        task_id=f"unquote-{content_hash(text)[:12]}",
+        log=log,
+    )
+    _invalidate_cite_check(vault, tag)
+    return len(ops)
 
 
 def _ship(vault: Vault, tag: str, tier: str) -> dict[str, Any]:
@@ -1019,6 +1035,18 @@ async def execute_run(
             context = context_for(vault, run_tag, runtime.name, query, profile, tier)
             steps = step_ids_for(tier, profile, vault.config_path)
 
+    mutated = _unquote_unmatched_report(vault, run_tag, log=log)
+    if mutated and context.tier != "light":
+        await _run_cite_check(
+            vault,
+            run_tag,
+            runtime,
+            context,
+            log,
+            _role_model(resolved, "cite_checker"),
+            f"cite-check-after-unquote-{_report_hash(vault, run_tag)[:16]}",
+            ledger,
+        )
     result = _ship(vault, run_tag, context.tier)
     manifest = load_manifest(vault, run_tag)
     return {"manifest": manifest, "verify": result, "tag": run_tag}

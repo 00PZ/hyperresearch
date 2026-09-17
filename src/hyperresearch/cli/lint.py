@@ -164,30 +164,34 @@ def _quote_in_notes(conn, quote: str) -> bool:
     return bool(hit)
 
 
-def unquote_unmatched_spans(conn, report_text: str, *, min_words: int = 5) -> tuple[str, int]:
-    """Drop quotation marks on >=min_words spans that are not in any vault note.
-
-    Upstream polish: quotation marks are reserved for verbatim source text.
-    The host applies that fix so a scare-quote cannot block ship-check.
-    Matched spans and short spans are left unchanged.
-    """
+def unmatched_quote_ops(
+    conn, report_text: str, *, min_words: int = 5
+) -> list[tuple[str, str]]:
+    """Quoted span -> unquoted inner text for unmatched >=min_words spans."""
     import re as _re
 
-    n = 0
-    parts: list[str] = []
-    last = 0
+    ops: list[tuple[str, str]] = []
     for m in _QUOTE_SPAN_RE.finditer(report_text):
         quote = _re.sub(r"\s+", " ", m.group(1)).strip()
         if len(quote.split()) < min_words or _quote_in_notes(conn, quote):
             continue
-        parts.append(report_text[last:m.start()])
-        parts.append(m.group(1))
-        last = m.end()
-        n += 1
-    if n == 0:
+        ops.append((m.group(0), m.group(1)))
+    return ops
+
+
+def unquote_unmatched_spans(conn, report_text: str, *, min_words: int = 5) -> tuple[str, int]:
+    """Drop quotation marks on >=min_words spans that are not in any vault note.
+
+    Upstream polish: quotation marks are reserved for verbatim source text.
+    Matched spans and short spans are left unchanged.
+    """
+    ops = unmatched_quote_ops(conn, report_text, min_words=min_words)
+    if not ops:
         return report_text, 0
-    parts.append(report_text[last:])
-    return "".join(parts), n
+    out = report_text
+    for old, new in ops:
+        out = out.replace(old, new, 1)
+    return out, len(ops)
 
 
 def _check_numeric_consistency(vault, conn, report_path, report_text) -> list[dict]:

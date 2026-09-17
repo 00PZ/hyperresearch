@@ -17,7 +17,7 @@ from hyperresearch.pipeline.orchestrator import (
     execute_run,
     report_path,
 )
-from hyperresearch.pipeline.patch import content_hash
+from hyperresearch.pipeline.patch import PatchState, content_hash
 from hyperresearch.runtime import AgentResult, FakeRuntime
 
 REPORT = "## Findings\n\n" + (
@@ -204,3 +204,53 @@ def test_draft_payload_contains_digest_analysis_marker(tmp_vault):
     drafts = [c for c in rt.calls if c.role == "draft"]
     assert drafts
     assert marker in drafts[0].payload
+
+def test_ship_unquote_cannot_restamp_stale_cite_check(tmp_vault):
+    """Review reproduction: unmatched quote + extra assertion must not inherit old audit."""
+    tag = "fl-unquote-stale"
+    plant_src(tmp_vault, tag)
+    result = run(execute_run(tmp_vault, "What is X?", _rt(), profile="full", tag=tag))
+    assert result["manifest"]["status"] == "verified"
+    findings_path = tmp_vault.run_dir(tag) / CITE_FINDINGS
+    before = json.loads(findings_path.read_text(encoding="utf-8"))
+    assert before.get("ok") is True
+    cite_before = before.get("report_hash")
+    path = report_path(tmp_vault, tag)
+    extra = (
+        "\nThe source states \u201cthis product guarantees unlimited profit forever\u201d "
+        "[[src-note]]. Unrelated assertion about purple sky.\n"
+    )
+    path.write_text(path.read_text(encoding="utf-8-sig") + extra, encoding="utf-8")
+    state_before = PatchState.load(tmp_vault.run_dir(tag) / "patch-state.json")
+    shipped = _ship(tmp_vault, tag, "full")
+    manifest = load_manifest(tmp_vault, tag)
+    assert manifest["status"] != "verified"
+    assert shipped.get("passed") is not True
+    after = json.loads(findings_path.read_text(encoding="utf-8"))
+    report = path.read_text(encoding="utf-8-sig")
+    assert after.get("ok") is not True
+    assert after.get("report_hash") != content_hash(report)
+    assert cite_before != content_hash(report)
+    state_after = PatchState.load(tmp_vault.run_dir(tag) / "patch-state.json")
+    assert state_after.cumulative_hunks >= state_before.cumulative_hunks
+    assert "this product guarantees unlimited profit forever" in report
+
+
+def test_ship_unquote_counts_patch_accounting(tmp_vault):
+    tag = "fl-unquote-acct"
+    plant_src(tmp_vault, tag)
+    result = run(execute_run(tmp_vault, "What is X?", _rt(), profile="full", tag=tag))
+    assert result["manifest"]["status"] == "verified"
+    path = report_path(tmp_vault, tag)
+    path.write_text(
+        path.read_text(encoding="utf-8-sig")
+        + "\nnot the same as \u201cofficial materials do not specify\u201d here.\n",
+        encoding="utf-8",
+    )
+    before = PatchState.load(tmp_vault.run_dir(tag) / "patch-state.json")
+    _ship(tmp_vault, tag, "full")
+    after = PatchState.load(tmp_vault.run_dir(tag) / "patch-state.json")
+    assert after.cumulative_bytes > before.cumulative_bytes
+    assert after.cumulative_hunks > before.cumulative_hunks
+    manifest = load_manifest(tmp_vault, tag)
+    assert manifest["status"] != "verified"

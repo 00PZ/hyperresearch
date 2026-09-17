@@ -58,7 +58,11 @@ def _wire_signature(body: str, title: str) -> str | None:
     return f"{marker}|{' '.join(tokens)}"
 
 
-def compute_independence(vault, tag: str | None = None) -> dict:
+def compute_independence(
+    vault,
+    tag: str | None = None,
+    note_ids: list[str] | None = None,
+) -> dict:
     """Cluster derivative sources, write independence scores. Returns summary."""
     conn = vault.db
     query = (
@@ -67,7 +71,14 @@ def compute_independence(vault, tag: str | None = None) -> dict:
         "WHERE n.source IS NOT NULL AND n.type NOT IN ('index')"
     )
     params: tuple = ()
-    if tag:
+    if note_ids is not None:
+        wanted = [n for n in note_ids if n]
+        if not wanted:
+            return {"scored": 0, "clusters": [], "audited": []}
+        placeholders = ",".join("?" for _ in wanted)
+        query += f" AND n.id IN ({placeholders})"
+        params = tuple(wanted)
+    elif tag:
         query += " AND n.id IN (SELECT note_id FROM tags WHERE tag = ?)"
         params = (tag,)
     rows = [dict(r) for r in conn.execute(query, params).fetchall()]
@@ -148,4 +159,4 @@ def compute_independence(vault, tag: str | None = None) -> dict:
             "kind": "+".join(sorted(k for k in kinds if k)) or "mixed",
         })
     conn.commit()
-    return {"scored": scored, "clusters": clusters}
+    return {"scored": scored, "clusters": clusters, "audited": [r["id"] for r in rows]}

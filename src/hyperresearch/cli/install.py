@@ -30,8 +30,13 @@ def install(
         "--profile",
         help="Pipeline profile to render skill/agent prompts from (built-in gears: full, premier; plus any [profile.*] defined in .hyperresearch/config.toml). Defaults to the gear persisted by `hyperresearch profile use` (or 'full'). See `hyperresearch profile list`.",
     ),
+    claude: bool = typer.Option(
+        False,
+        "--claude",
+        help="Claude Code session extra: write .claude skills/hooks/agents and CLAUDE.md. Not required for hpr run.",
+    ),
 ) -> None:
-    """Install hyperresearch: init vault + inject CLAUDE.md + install Claude Code hooks."""
+    """Install hyperresearch: init vault. Pass --claude for Claude Code session files."""
     import sys
 
     from hyperresearch.core.hooks import (
@@ -162,17 +167,16 @@ def install(
 
     hpr_path = _resolve_executable()
 
-    # Step 3: Always re-inject CLAUDE.md (updates blurb + path)
-    doc_actions = inject_agent_docs(root)
-
-    # Step 4: Install Claude Code hook + skills + subagents (rendered from the
-    # gear profile — explicit --profile, else the gear persisted in config)
     project_config = root / ".hyperresearch" / "config.toml"
     project_config_path = project_config if project_config.exists() else None
     project_profile = _default_profile(project_config_path)
     _check_profile(project_profile, project_config_path)
-    hook_actions = install_hooks(root, hpr_path=hpr_path, profile=project_profile)
 
+    hook_actions: list[str] = []
+    doc_actions: list[str] = []
+    if claude:
+        doc_actions = inject_agent_docs(root)
+        hook_actions = install_hooks(root, hpr_path=hpr_path, profile=project_profile)
     # Step 3: Auto-configure crawl4ai if installed
     crawl4ai_status = _setup_crawl4ai(vault)
 

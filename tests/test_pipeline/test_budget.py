@@ -1,0 +1,160 @@
+"""Persistent run-wide budget: zero blocks dispatch; resume keeps spend."""
+
+from __future__ import annotations
+
+import threading
+
+import pytest
+
+from hyperresearch.core.runs import init_run, load_manifest
+from hyperresearch.pipeline.host_actions import SpendLedger
+from hyperresearch.pipeline.orchestrator import execute_run, resume_run
+from hyperresearch.runtime import AgentResult, FakeRuntime
+from tests.test_pipeline.test_full import _rt, plant_src, run
+
+
+def test_budget_usd_zero_prevents_paid_model_dispatch(tmp_vault):
+    plant_src(tmp_vault, "bud-zero")
+    rt = _rt()
+    result = run(
+        execute_run(
+            tmp_vault,
+            "What is X?",
+            rt,
+            profile="full",
+            tag="bud-zero",
+            budget_usd=0,
+        )
+    )
+    assert rt.calls == []
+    assert result["manifest"]["status"] == "blocked"
+    assert result["manifest"]["blocked_on"] == "budget"
+    assert result["manifest"]["status"] != "verified"
+    assert result["manifest"]["status"] != "completed"
+
+
+def test_stages_cannot_each_consume_entire_budget(tmp_vault):
+    plant_src(tmp_vault, "bud-share")
+    rt = _rt()
+    result = run(
+        execute_run(
+            tmp_vault,
+            "What is X?",
+            rt,
+            profile="full",
+            tag="bud-share",
+            budget_usd=2,
+        )
+    )
+    # Default reserve is 1 USD per dispatch. Two calls, then blocked.
+    assert len(rt.calls) == 2
+    assert result["manifest"]["status"] == "blocked"
+    assert result["manifest"]["blocked_on"] == "budget"
+    spent = result["manifest"]["spend"]["estimated_usd"]
+    assert spent >= 2
+
+
+def test_resume_preserves_spend(tmp_vault):
+    plant_src(tmp_vault, "bud-resume")
+    rt = _rt()
+    first = run(
+        execute_run(
+            tmp_vault,
+            "What is X?",
+            rt,
+            profile="full",
+            tag="bud-resume",
+            budget_usd=2,
+        )
+    )
+    spent = first["manifest"]["spend"]["estimated_usd"]
+    assert spent > 0
+    rt2 = FakeRuntime(default="should-not-reset")
+    second = run(resume_run(tmp_vault, "bud-resume", rt2))
+    assert second["manifest"]["spend"]["estimated_usd"] == spent
+    assert load_manifest(tmp_vault, "bud-resume")["spend"]["estimated_usd"] == spent
+
+
+def test_exhaustion_cannot_produce_verified(tmp_vault):
+    plant_src(tmp_vault, "bud-exh")
+    result = run(
+        execute_run(
+            tmp_vault,
+            "What is X?",
+            _rt(),
+            profile="full",
+            tag="bud-exh",
+            budget_usd=1,
+        )
+    )
+    assert result["manifest"]["status"] == "blocked"
+    assert result["manifest"]["status"] != "verified"
+    assert result["manifest"]["status"] != "completed"
+
+
+def test_low_actual_cost_settlement_keeps_remaining_usable(tmp_vault):
+    plant_src(tmp_vault, "bud-frac")
+
+    class Cheap(FakeRuntime):
+        async def run(self, task, context):
+            r = await super().run(task, context)
+            return AgentResult(
+                text=r.text,
+                structured=r.structured,
+                usage={"cost_usd": 0.01},
+                requested_model=r.requested_model,
+                reported_model=r.reported_model,
+                runtime_metadata=dict(r.runtime_metadata),
+            )
+
+    rt = Cheap(responses=_rt().responses)
+    result = run(
+        execute_run(
+            tmp_vault,
+            "What is X?",
+            rt,
+            profile="full",
+            tag="bud-frac",
+            budget_usd=1,
+        )
+    )
+    assert len(rt.calls) > 1
+    spent = result["manifest"]["spend"]["estimated_usd"]
+    assert spent == pytest.approx(0.01 * len(rt.calls), abs=0.0001)
+    assert spent < 1
+    assert result["manifest"]["status"] == "verified"
+    assert result["manifest"]["blocked_on"] is None
+
+
+def test_oversized_reservation_not_admitted(tmp_vault):
+    init_run(tmp_vault, "bud-over", profile="full", budget_usd=0.50, query="q")
+    ledger = SpendLedger(tmp_vault, "bud-over", default_call_cost=1.00)
+    assert ledger.reserve(1.00) is False
+    assert ledger.pending == 0.0
+
+
+def test_smaller_fitting_reservation_admitted(tmp_vault):
+    init_run(tmp_vault, "bud-fit", profile="full", budget_usd=0.50, query="q")
+    ledger = SpendLedger(tmp_vault, "bud-fit", default_call_cost=1.00)
+    assert ledger.reserve(0.10) is True
+    assert ledger.pending == pytest.approx(0.10)
+
+
+def test_concurrent_reservations_cannot_each_exceed_ceiling(tmp_vault):
+    init_run(tmp_vault, "bud-conc", profile="full", budget_usd=1.00, query="q")
+    ledger = SpendLedger(tmp_vault, "bud-conc", default_call_cost=1.00)
+    barrier = threading.Barrier(2)
+    got: list[bool] = []
+
+    def attempt() -> None:
+        barrier.wait()
+        got.append(ledger.reserve(1.00))
+
+    threads = [threading.Thread(target=attempt) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert got.count(True) == 1
+    assert got.count(False) == 1
+    assert ledger.pending == pytest.approx(1.00)

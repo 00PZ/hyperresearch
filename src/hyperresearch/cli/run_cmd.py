@@ -5,13 +5,23 @@ from __future__ import annotations
 import json
 
 import typer
+from typer.core import TyperGroup
 
 from hyperresearch.cli._output import console, output
 from hyperresearch.core.vault import VaultError
 from hyperresearch.models.output import error, success
 
-app = typer.Typer()
 
+class _RunGroup(TyperGroup):
+    """`hpr run "<query>"` starts a host pipeline; subcommands stay as-is."""
+
+    def parse_args(self, ctx, args):
+        if args and not str(args[0]).startswith("-") and args[0] not in self.commands:
+            args = ["go", *list(args)]
+        return super().parse_args(ctx, args)
+
+
+app = typer.Typer(cls=_RunGroup, no_args_is_help=True)
 
 def _vault_or_exit(json_output: bool):
     from hyperresearch.core.vault import Vault
@@ -156,14 +166,49 @@ def run_list(
             console.print(f"  [cyan]{r['vault_tag']}[/] {r['status']} ({r['profile']}) {r['started_at']}")
 
 
+def _make_runtime(name: str):
+    if name == "model":
+        from hyperresearch.runtime.model import ModelRuntime
+
+        return ModelRuntime.from_env()
+    from hyperresearch.runtime.fake import FakeRuntime
+
+    return FakeRuntime(default={"kind": "complete", "args": {}, "reason": "fake-default"})
+
+
+@app.command("go", hidden=True)
+def run_go(
+    query: str = typer.Argument(..., help="Research question"),
+    runtime_name: str = typer.Option("fake", "--runtime", help="fake | model"),
+    profile: str = typer.Option("light", "--profile", help="light | full | premier"),
+    budget: float | None = typer.Option(None, "--budget"),
+) -> None:
+    """Start a host-owned research run (invoked as `hpr run \"<query>\"`)."""
+    import asyncio
+
+    from hyperresearch.pipeline.orchestrator import execute_run
+
+    vault = _vault_or_exit(False)
+    result = asyncio.run(
+        execute_run(vault, query, _make_runtime(runtime_name), profile=profile, budget_usd=budget)
+    )
+    manifest = result["manifest"]
+    console.print(f"[green]{result['tag']}[/] status={manifest.get('status')}")
+    if manifest.get("status") == "blocked":
+        raise typer.Exit(1)
+
+
 @app.command("resume")
 def run_resume(
     vault_tag: str | None = typer.Argument(None, help="Run tag (default: newest run)"),
     json_output: bool = typer.Option(False, "--json", "-j", help="JSON output"),
+    runtime_name: str = typer.Option("fake", "--runtime", help="fake | model"),
 ) -> None:
-    """Print the exact position a recovering orchestrator should continue from."""
-    from hyperresearch.core.hooks import step_skill_slug
+    """Continue from the last checkpoint. Executes the next host step (not a Claude Skill)."""
+    import asyncio
+
     from hyperresearch.core.runs import RunError, load_manifest, resume_position, set_status
+    from hyperresearch.pipeline.orchestrator import resume_run
 
     vault = _vault_or_exit(json_output)
     tag = _resolve_tag(vault, vault_tag, json_output)
@@ -180,25 +225,34 @@ def run_resume(
     if manifest["status"] in ("paused", "blocked", "failed"):
         set_status(vault, tag, "running")
 
+    executed = None
+    if position["next_step"] is not None:
+        try:
+            executed = asyncio.run(resume_run(vault, tag, _make_runtime(runtime_name)))
+            manifest = executed["manifest"]
+            position = resume_position(manifest)
+        except Exception as e:
+            if json_output:
+                output(error(str(e), "RUN_ERROR"), json_mode=True)
+            else:
+                console.print(f"[red]Error:[/] {e}")
+            raise typer.Exit(1)
+
     data = {
         "vault_tag": tag,
         "run_dir": str(vault.run_dir(tag)),
         "profile": manifest["profile"],
+        "status": manifest.get("status"),
         **position,
-        # Looked up from the installer's step-skill roster, not rebuilt by
-        # string substitution — "2" must come back as the invokable
-        # `hyperresearch-2-width-sweep`, never a bare `hyperresearch-2`.
-        "skill_to_invoke": step_skill_slug(position["next_step"]),
+        "skill_to_invoke": None,
     }
     if json_output:
         output(success(data, vault=str(vault.root)), json_mode=True)
     else:
         if position["next_step"] is None:
-            console.print(f"[green]{tag}[/] — all profile steps complete.")
+            console.print(f"[green]{tag}[/] — all profile steps complete. status={manifest.get('status')}")
         else:
-            console.print(f"[green]{tag}[/] — resume at step {position['next_step']}")
-            console.print(f"  Skill(skill: \"{data['skill_to_invoke']}\")")
-
+            console.print(f"[green]{tag}[/] — next host step {position['next_step']}")
 
 @app.command("abort")
 def run_abort(

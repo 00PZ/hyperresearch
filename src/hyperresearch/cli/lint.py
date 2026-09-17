@@ -147,6 +147,53 @@ def _check_quote_integrity(vault, conn, report_path, report_text) -> list[dict]:
     return issues
 
 
+def _quote_in_notes(conn, quote: str) -> bool:
+    """True when the whitespace-normalized span is in some note body (FTS)."""
+    import re as _re
+
+    phrase = _re.sub(r"\s+", " ", quote).strip().replace('"', " ").replace("'", "''")
+    if not phrase:
+        return False
+    try:
+        hit = conn.execute(
+            'SELECT id FROM notes_fts WHERE notes_fts MATCH ? LIMIT 1',
+            (f'body_plain: "{phrase}"',),
+        ).fetchone()
+    except Exception:
+        hit = None
+    return bool(hit)
+
+
+def unmatched_quote_ops(
+    conn, report_text: str, *, min_words: int = 5
+) -> list[tuple[str, str]]:
+    """Quoted span -> unquoted inner text for unmatched >=min_words spans."""
+    import re as _re
+
+    ops: list[tuple[str, str]] = []
+    for m in _QUOTE_SPAN_RE.finditer(report_text):
+        quote = _re.sub(r"\s+", " ", m.group(1)).strip()
+        if len(quote.split()) < min_words or _quote_in_notes(conn, quote):
+            continue
+        ops.append((m.group(0), m.group(1)))
+    return ops
+
+
+def unquote_unmatched_spans(conn, report_text: str, *, min_words: int = 5) -> tuple[str, int]:
+    """Drop quotation marks on >=min_words spans that are not in any vault note.
+
+    Upstream polish: quotation marks are reserved for verbatim source text.
+    Matched spans and short spans are left unchanged.
+    """
+    ops = unmatched_quote_ops(conn, report_text, min_words=min_words)
+    if not ops:
+        return report_text, 0
+    out = report_text
+    for old, new in ops:
+        out = out.replace(old, new, 1)
+    return out, len(ops)
+
+
 def _check_numeric_consistency(vault, conn, report_path, report_text) -> list[dict]:
     """Substantive numbers in the report should be traceable to claims or
     cited note bodies. Warning severity — legitimate derived arithmetic

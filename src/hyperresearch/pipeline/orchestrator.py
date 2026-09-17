@@ -338,6 +338,24 @@ def _cite_check_bound(vault: Vault, tag: str) -> bool:
     )
 
 
+def _cite_check_examined_current(vault: Vault, tag: str) -> bool:
+    """True when findings are for the current report+evidence hashes (pass or fail)."""
+    path = vault.run_dir(tag) / CITE_FINDINGS
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    report_h = data.get("report_hash") or ""
+    evidence_h = data.get("evidence_hash") or ""
+    if not report_h or not evidence_h:
+        return False
+    return report_h == _report_hash(vault, tag) and evidence_h == _evidence_hash(vault, tag)
+
+
 def _write_independence(vault: Vault, tag: str, summary: dict[str, Any]) -> None:
     data = {
         "evidence_hash": _evidence_hash(vault, tag),
@@ -1035,18 +1053,31 @@ async def execute_run(
             context = context_for(vault, run_tag, runtime.name, query, profile, tier)
             steps = step_ids_for(tier, profile, vault.config_path)
 
-    mutated = _unquote_unmatched_report(vault, run_tag, log=log)
-    if mutated and context.tier != "light":
-        await _run_cite_check(
-            vault,
-            run_tag,
-            runtime,
-            context,
-            log,
-            _role_model(resolved, "cite_checker"),
-            f"cite-check-after-unquote-{_report_hash(vault, run_tag)[:16]}",
-            ledger,
-        )
+    _unquote_unmatched_report(vault, run_tag, log=log)
+    live_tail = load_manifest(vault, run_tag)
+    step_145_done = live_tail.get("steps", {}).get("14.5", {}).get("status") == "done"
+    findings_exist = (run_dir / CITE_FINDINGS).exists()
+    if (
+        context.tier != "light"
+        and (step_145_done or findings_exist)
+        and not _cite_check_examined_current(vault, run_tag)
+    ):
+        try:
+            await _run_cite_check(
+                vault,
+                run_tag,
+                runtime,
+                context,
+                log,
+                _role_model(resolved, "cite_checker"),
+                f"cite-check-after-unquote-{_report_hash(vault, run_tag)[:16]}",
+                ledger,
+            )
+        except BudgetExhaustedError:
+            pass
+        except RuntimeError as exc:
+            if not str(exc).startswith("uncertain_remote:"):
+                raise
     result = _ship(vault, run_tag, context.tier)
     manifest = load_manifest(vault, run_tag)
     return {"manifest": manifest, "verify": result, "tag": run_tag}

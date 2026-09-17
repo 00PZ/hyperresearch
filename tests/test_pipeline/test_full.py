@@ -14,11 +14,14 @@ from hyperresearch.pipeline.orchestrator import (
     INDEPENDENCE_ARTIFACT,
     _evidence_hash,
     _ship,
+    _unquote_unmatched_report,
     execute_run,
     report_path,
+    resume_run,
 )
 from hyperresearch.pipeline.patch import PatchState, content_hash
 from hyperresearch.runtime import AgentResult, FakeRuntime
+from hyperresearch.runtime.errors import UncertainSubmission
 
 REPORT = "## Findings\n\n" + (
     "Substantive sentence with real evidence attached [[src-note]]. " * 80
@@ -254,3 +257,56 @@ def test_ship_unquote_counts_patch_accounting(tmp_vault):
     assert after.cumulative_hunks > before.cumulative_hunks
     manifest = load_manifest(tmp_vault, tag)
     assert manifest["status"] != "verified"
+
+
+def test_resume_runs_pending_final_cite_check_after_cleanup(tmp_vault):
+    """Crash after unquote persist, before audit: resume runs the audit once."""
+    tag = "fl-unquote-resume"
+    plant_src(tmp_vault, tag)
+    first = run(execute_run(tmp_vault, "What is X?", _rt(), profile="full", tag=tag))
+    assert first["manifest"]["status"] == "verified"
+    path = report_path(tmp_vault, tag)
+    path.write_text(
+        path.read_text(encoding="utf-8-sig")
+        + "\nnot the same as \u201cofficial materials do not specify\u201d here.\n",
+        encoding="utf-8",
+    )
+    assert _unquote_unmatched_report(tmp_vault, tag) >= 1
+    rt2 = _rt()
+    second = run(resume_run(tmp_vault, tag, rt2))
+    cite = [c for c in rt2.calls if c.role == "cite_checker"]
+    assert len(cite) == 1
+    assert second["manifest"]["status"] == "verified"
+
+
+def test_resume_uncertain_final_cite_check_does_not_repost(tmp_vault):
+    tag = "fl-unquote-unc"
+    plant_src(tmp_vault, tag)
+    first = run(execute_run(tmp_vault, "What is X?", _rt(), profile="full", tag=tag))
+    assert first["manifest"]["status"] == "verified"
+    path = report_path(tmp_vault, tag)
+    path.write_text(
+        path.read_text(encoding="utf-8-sig")
+        + "\nnot the same as \u201cofficial materials do not specify\u201d here.\n",
+        encoding="utf-8",
+    )
+    assert _unquote_unmatched_report(tmp_vault, tag) >= 1
+
+    class Unc(FakeRuntime):
+        posts = 0
+
+        async def run(self, task, context):
+            if task.role == "cite_checker":
+                type(self).posts += 1
+                raise UncertainSubmission("read reset")
+            return await super().run(task, context)
+
+    Unc.posts = 0
+    rt = Unc(responses=_rt().responses)
+    second = run(resume_run(tmp_vault, tag, rt))
+    assert Unc.posts == 1
+    assert load_manifest(tmp_vault, tag)["status"] != "verified"
+    run(resume_run(tmp_vault, tag, rt))
+    assert Unc.posts == 1
+    assert load_manifest(tmp_vault, tag)["status"] != "verified"
+    assert second["manifest"]["status"] != "verified"

@@ -310,3 +310,39 @@ def test_resume_uncertain_final_cite_check_does_not_repost(tmp_vault):
     assert Unc.posts == 1
     assert load_manifest(tmp_vault, tag)["status"] != "verified"
     assert second["manifest"]["status"] != "verified"
+
+
+def test_duplicate_unmatched_quotes_are_unquoted(tmp_vault):
+    """Same unmatched span twice: cleanup uses occurrence, run continues."""
+    tag = "fl-dup-quote"
+    plant_src(tmp_vault, tag)
+    phrase = "a framing phrase with five words"
+    quoted = f"\u201c{phrase}\u201d"
+    body = REPORT + f"\n{quoted}\n{quoted}\n"
+    result = run(execute_run(
+        tmp_vault, "What is X?", _rt(draft=body, synthesizer=body), profile="full", tag=tag,
+    ))
+    text = report_path(tmp_vault, tag).read_text(encoding="utf-8-sig")
+    assert quoted not in text
+    assert phrase in text
+    assert result["manifest"]["status"] == "verified"
+
+
+def test_finalization_exception_persists_blocked_not_running(tmp_vault, monkeypatch):
+    """Unexpected ship failure must not leave the manifest running."""
+    tag = "fl-final-err"
+    plant_src(tmp_vault, tag)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("finalization boom")
+
+    monkeypatch.setattr("hyperresearch.pipeline.orchestrator._ship", boom)
+    try:
+        run(execute_run(tmp_vault, "What is X?", _rt(), profile="full", tag=tag))
+    except RuntimeError as exc:
+        assert "finalization boom" in str(exc)
+    else:
+        raise AssertionError("expected finalization boom")
+    manifest = load_manifest(tmp_vault, tag)
+    assert manifest["status"] == "blocked"
+    assert manifest.get("blocked_on") == "host-error"

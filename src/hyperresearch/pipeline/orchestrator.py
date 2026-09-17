@@ -924,7 +924,17 @@ def _unquote_unmatched_report(vault: Vault, tag: str, log: TaskLog | None = None
     raw = unmatched_quote_ops(vault.db, text)
     if not raw:
         return 0
-    ops = tuple(PatchOp(old_text=old, new_text=new) for old, new in raw)
+    # Sequential apply: duplicate quoted spans are not unique in the original
+    # text. occurrence=1 replaces the first remaining match per op. Unique
+    # spans keep occurrence=None so the unique-match guard still applies.
+    ops = tuple(
+        PatchOp(
+            old_text=old,
+            new_text=new,
+            occurrence=1 if text.count(old) > 1 else None,
+        )
+        for old, new in raw
+    )
     apply_patch_set(
         path,
         PatchSet(base_report_hash=content_hash(text), ops=ops),
@@ -935,6 +945,13 @@ def _unquote_unmatched_report(vault: Vault, tag: str, log: TaskLog | None = None
     )
     _invalidate_cite_check(vault, tag)
     return len(ops)
+
+
+def _block_if_still_running(vault: Vault, tag: str, blocked_on: str = "host-error") -> None:
+    """Persist blocked only when the run would otherwise exit as running."""
+    live = load_manifest(vault, tag)
+    if live.get("status") == "running":
+        set_status(vault, tag, "blocked", blocked_on=blocked_on)
 
 
 def _ship(vault: Vault, tag: str, tier: str) -> dict[str, Any]:
@@ -1047,7 +1064,7 @@ async def execute_run(
         except BudgetExhaustedError:
             break
         except Exception:
-            set_status(vault, run_tag, "blocked", blocked_on="host-error")
+            _block_if_still_running(vault, run_tag)
             raise
         if load_manifest(vault, run_tag).get("status") == "blocked":
             break
@@ -1056,32 +1073,38 @@ async def execute_run(
             context = context_for(vault, run_tag, runtime.name, query, profile, tier)
             steps = step_ids_for(tier, profile, vault.config_path)
 
-    _unquote_unmatched_report(vault, run_tag, log=log)
-    live_tail = load_manifest(vault, run_tag)
-    step_145_done = live_tail.get("steps", {}).get("14.5", {}).get("status") == "done"
-    findings_exist = (run_dir / CITE_FINDINGS).exists()
-    if (
-        context.tier != "light"
-        and (step_145_done or findings_exist)
-        and not _cite_check_examined_current(vault, run_tag)
-    ):
-        try:
-            await _run_cite_check(
-                vault,
-                run_tag,
-                runtime,
-                context,
-                log,
-                _role_model(resolved, "cite_checker"),
-                f"cite-check-after-unquote-{_report_hash(vault, run_tag)[:16]}",
-                ledger,
-            )
-        except BudgetExhaustedError:
-            pass
-        except RuntimeError as exc:
-            if not str(exc).startswith("uncertain_remote:"):
-                raise
-    result = _ship(vault, run_tag, context.tier)
+    try:
+        _unquote_unmatched_report(vault, run_tag, log=log)
+        live_tail = load_manifest(vault, run_tag)
+        step_145_done = live_tail.get("steps", {}).get("14.5", {}).get("status") == "done"
+        findings_exist = (run_dir / CITE_FINDINGS).exists()
+        if (
+            context.tier != "light"
+            and (step_145_done or findings_exist)
+            and not _cite_check_examined_current(vault, run_tag)
+        ):
+            try:
+                await _run_cite_check(
+                    vault,
+                    run_tag,
+                    runtime,
+                    context,
+                    log,
+                    _role_model(resolved, "cite_checker"),
+                    f"cite-check-after-unquote-{_report_hash(vault, run_tag)[:16]}",
+                    ledger,
+                )
+            except BudgetExhaustedError:
+                pass
+            except RuntimeError as exc:
+                if not str(exc).startswith("uncertain_remote:"):
+                    raise
+        result = _ship(vault, run_tag, context.tier)
+    except BudgetExhaustedError:
+        result = {"passed": False, "blocked_on": "budget"}
+    except Exception:
+        _block_if_still_running(vault, run_tag)
+        raise
     manifest = load_manifest(vault, run_tag)
     return {"manifest": manifest, "verify": result, "tag": run_tag}
 

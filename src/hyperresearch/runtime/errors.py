@@ -37,3 +37,13 @@ class IllegalHostAction(AgentRuntimeError):  # noqa: N818
 
 class BrowserUnsupported(AgentRuntimeError):  # noqa: N818
     """Claude-in-Chrome / browser-fetcher is unsupported in Spec 1."""
+
+
+class SearchBlockError(Exception):
+    """Host search failed closed. blocked_on=search must survive generic handling."""
+
+    blocked_on = "search"
+
+    def __init__(self, blocked_reason: str, message: str = "") -> None:
+        self.blocked_reason = blocked_reason
+        super().__init__(message or blocked_reason)

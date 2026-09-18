@@ -265,12 +265,23 @@ def add_spend(
     return manifest
 
 
-def set_status(vault, vault_tag: str, status: str, blocked_on: str | None = None) -> dict:
+def set_status(
+    vault,
+    vault_tag: str,
+    status: str,
+    blocked_on: str | None = None,
+    blocked_reason: str | None = None,
+) -> dict:
     if status not in RUN_STATUSES:
         raise RunError(f"invalid run status '{status}' (one of {RUN_STATUSES})")
     manifest = load_manifest(vault, vault_tag)
     manifest["status"] = status
-    manifest["blocked_on"] = blocked_on if status == "blocked" else None
+    if status == "blocked":
+        manifest["blocked_on"] = blocked_on
+        manifest["blocked_reason"] = blocked_reason
+    else:
+        manifest["blocked_on"] = None
+        manifest["blocked_reason"] = None
     _save(vault, vault_tag, manifest)
     return manifest
 

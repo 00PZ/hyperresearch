@@ -105,3 +105,6 @@ strict = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra -q --strict-markers"
+markers = [
+    "searxng_live: live SearXNG JSON probe; needs HYPERRESEARCH_LIVE_SEARXNG=1 and SEARXNG_URL",
+]

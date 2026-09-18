@@ -97,3 +97,16 @@ def seeded_vault(tmp_vault: Vault) -> Vault:
     execute_sync(tmp_vault, plan)
 
     return tmp_vault
+
+
+def pytest_collection_modifyitems(config, items):
+    import os
+
+    markexpr = getattr(config.option, "markexpr", "") or ""
+    live_requested = "searxng_live" in markexpr and "not searxng_live" not in markexpr
+    live_enabled = (
+        os.environ.get("HYPERRESEARCH_LIVE_SEARXNG") == "1" and bool(os.environ.get("SEARXNG_URL"))
+    )
+    if live_requested and live_enabled:
+        return
+    items[:] = [item for item in items if item.get_closest_marker("searxng_live") is None]

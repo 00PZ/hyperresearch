@@ -38,7 +38,12 @@ from hyperresearch.pipeline.prompts import (
     report_extra,
     role_payload,
 )
-from hyperresearch.runtime.errors import BrowserUnsupported, RuntimeFailure, UncertainSubmission
+from hyperresearch.runtime.errors import (
+    BrowserUnsupported,
+    RuntimeFailure,
+    SearchBlockError,
+    UncertainSubmission,
+)
 from hyperresearch.runtime.types import (
     AgentResult,
     AgentRuntime,
@@ -947,11 +952,23 @@ def _unquote_unmatched_report(vault: Vault, tag: str, log: TaskLog | None = None
     return len(ops)
 
 
-def _block_if_still_running(vault: Vault, tag: str, blocked_on: str = "host-error") -> None:
+def _block_if_still_running(
+    vault: Vault,
+    tag: str,
+    blocked_on: str = "host-error",
+    blocked_reason: str | None = None,
+) -> None:
     """Persist blocked only when the run would otherwise exit as running."""
     live = load_manifest(vault, tag)
+    if live.get("status") == "blocked" and live.get("blocked_on") in {
+        "budget",
+        "verify",
+        "cite-check",
+        "independence",
+    }:
+        return
     if live.get("status") == "running":
-        set_status(vault, tag, "blocked", blocked_on=blocked_on)
+        set_status(vault, tag, "blocked", blocked_on=blocked_on, blocked_reason=blocked_reason)
 
 
 def _ship(vault: Vault, tag: str, tier: str) -> dict[str, Any]:
@@ -1041,6 +1058,30 @@ async def execute_run(
     budget = budget_from_profile(resolved, manifest)
     ledger = SpendLedger(vault=vault, tag=run_tag)
     executor = HostExecutor(vault=vault, workspace_root=vault.root, run_tag=run_tag)
+    from hyperresearch.web.searxng import validate_search_config
+
+    gate = validate_search_config(vault.config)
+    live0 = load_manifest(vault, run_tag)
+    if gate:
+        if live0.get("status") == "blocked" and live0.get("blocked_on") in {
+            "budget",
+            "verify",
+            "cite-check",
+            "independence",
+        }:
+            return {
+                "manifest": live0,
+                "verify": {"passed": False, "blocked_on": live0.get("blocked_on")},
+                "tag": run_tag,
+            }
+        set_status(vault, run_tag, "blocked", blocked_on="search", blocked_reason=gate)
+        return {
+            "manifest": load_manifest(vault, run_tag),
+            "verify": {"passed": False, "blocked_on": "search"},
+            "tag": run_tag,
+        }
+    if resume and live0.get("status") == "blocked" and live0.get("blocked_on") == "search":
+        set_status(vault, run_tag, "running")
 
     steps = step_ids_for(
         tier if (run_dir / "prompt-decomposition.json").exists() else (
@@ -1063,6 +1104,11 @@ async def execute_run(
             )
         except BudgetExhaustedError:
             break
+        except SearchBlockError as exc:
+            _block_if_still_running(
+                vault, run_tag, blocked_on="search", blocked_reason=exc.blocked_reason
+            )
+            raise
         except Exception:
             _block_if_still_running(vault, run_tag)
             raise
@@ -1102,6 +1148,11 @@ async def execute_run(
         result = _ship(vault, run_tag, context.tier)
     except BudgetExhaustedError:
         result = {"passed": False, "blocked_on": "budget"}
+    except SearchBlockError as exc:
+        _block_if_still_running(
+            vault, run_tag, blocked_on="search", blocked_reason=exc.blocked_reason
+        )
+        raise
     except Exception:
         _block_if_still_running(vault, run_tag)
         raise

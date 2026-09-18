@@ -2,7 +2,7 @@
 
 Implementer contract. Do not re-grill the JSON/HTML lock, the host-search seam, or the trip-log split. Do not implement until the operator says `go`.
 
-**Revision 1.5.3:** on successful SearXNG JSON (including empty SERP), host `hint` is `None` — do not reuse the crawl4ai “cannot web-search” string. 1.5.2 durable `SearchCallResult` / title-content rule still holds.
+**Revision 1.5.4:** `hpr install` does not overwrite existing `search_provider` / `fetch_provider`; JSONL append repairs a truncated tail under the lock; start-of-run search gate does not replace `budget` / `verify` / `cite-check` / `independence`. 1.5.3 hint rule still holds.
 
 Tracker: `/opt/data/.scratch/hyperresearch-fork/`
 Glossary: `CONTEXT.md`
@@ -112,13 +112,13 @@ class SearchCallResult:
 
 - Search-provider allowlist: `none` | `searxng`. Anything else is a start-of-run config error (`blocked_on=search`, `blocked_reason=searxng_config`).
 - Fetch-provider: existing factory names. `searxng` is not a fetch backend (`blocked_on=search` is wrong here — reject at config load / start with `blocked_reason=searxng_config` if a run would start; a vault that only fetches never needs SearXNG).
-- Application default: `search_provider = "none"` when the key is absent. Existing vaults stay vault-only and **keep starting**. Production setup must set `search_provider = "searxng"` explicitly. Pytest uses the same default.
+- Application default: `search_provider = "none"` when the key is absent. Existing vaults stay vault-only and **keep starting**. Production setup must set `search_provider = "searxng"` explicitly. Pytest uses the same default. `hpr install` writes `search_provider=searxng` and `fetch_provider=crawl4ai` only on **first** vault setup (or an explicit migration flag). Reinstall against a vault that already has those keys must **preserve** them. A vault saved as `none`/`builtin` must still be `none`/`builtin` after `hpr install`.
 - `fetch_provider` wins over deprecated `web.provider` when both are present. If only `provider` is present, it is `fetch_provider`. `provider` never selects search.
 - Config keys under `[web]`: `search_provider`, `fetch_provider`, `searxng_url`, `searxng_trip_log`. Do not add a `[searxng]` table. Do not reuse `[search]` or `[fetch]`.
 - Env: if `SEARXNG_URL` is **set** (including empty string), it is the resolved URL. If **unset**, use `searxng_url`. If `search_provider` is not `searxng`, both are ignored.
 - Resolved SearXNG URL (when provider is `searxng`) must be `http` or `https`, have a host, and have no userinfo (embedded credentials). Fail start: `blocked_on=search`, `blocked_reason=searxng_unconfigured` for missing/blank; `blocked_reason=searxng_config` for bad scheme/userinfo.
 - Serialization: `load` then `save` writes `search_provider`, `fetch_provider`, `searxng_url`, `searxng_trip_log`. It does not write `provider`. Unknown extra `[web]` keys remain ignored on load (existing forward-compat).
-- Start-of-run gate: `search_provider=searxng` and resolved URL missing/blank/invalid → do not start the step graph.
+- Start-of-run gate: `search_provider=searxng` and resolved URL missing/blank/invalid → do not start the step graph **only if** the run is otherwise runnable. Do not assign `blocked_on=search` over an already-persisted `budget`, `verify`, `cite-check`, or `independence` block (including `execute_run(..., resume=True)`). Invalid search config still blocks a `running` (or not-yet-blocked) run.
 - Request: `GET {resolved_url}/search?q=...&format=json`. Timeout 30s. **Follow redirects: off.** No automatic HTTP retry. No auth header. Do not expose extra SearXNG params from the model in v1.
 - 3xx, 4xx, 5xx, timeout, DNS, connect failure → `searxng_http`. A 302 `Location` to another host (including private) must not be requested. Tests assert request count == 1.
 - Response contract: body must parse as a JSON **object**. Missing `results` or a non-list `results` → `searxng_http`. HTML, empty body, or JSON array/string/number → `searxng_http`.
@@ -142,7 +142,7 @@ class SearchCallResult:
   - A **new** `event_id` must land in **both** JSONL files or the search action is not terminal success (`blocked_reason=searxng_trip_log`) until resume repairs it.
   - Resume with a durable `SearchCallResult`: complete any missing JSONL append from the saved trip-log row (same `event_id`, no second observation), then complete the host action from the saved hits. **Zero additional HTTP.** Do not append a duplicate to a file that already contains that `event_id`.
   - Crash after both appends and before the host-action success checkpoint: resume reads the durable `SearchCallResult`, does not HTTP, does not append again, returns the original hits to the model, then checkpoints success.
-  - Concurrent writers: exclusive lock (or equivalent) around each append. Aggregators and tests treat `event_id` as the unique key; duplicate lines with the same `event_id` count as one.
+  - Concurrent writers: exclusive lock (or equivalent) around each append. Aggregators and tests treat `event_id` as the unique key; duplicate lines with the same `event_id` count as one. Under that lock, if the file’s last record is truncated (no complete JSON object, with or without a trailing newline), repair or quarantine that fragment **before** appending the saved event. A complete final JSON object that only lacks a newline stays one valid record. After repair, the recovered `event_id` is independently parseable exactly once.
   - Every successful JSON search writes a row, including healthy hits, empty SERP, and empty SERP with all engines unresponsive. Failed searches (`searxng_http`) do **not** write a success row and do **not** persist a `SearchCallResult`.
 - SSRF split: search client contacts **only** the resolved SearXNG origin from config/env (private addresses allowed for that origin). Because redirects are off, that origin cannot change mid-call. Fetch of model URLs keeps the existing closed SSRF gate. Do not add the SearXNG host to global `allow_private_hosts` as a side effect of search.
 - Host search with `search_provider=none` is vault FTS only (plus injected `search_fn` in tests). Do not call crawl4ai `search()`.
@@ -178,7 +178,9 @@ Good tests assert external behaviour: which provider is called on `search` vs `f
 - Mock 500, 403, 302, timeout, DNS, 200 `text/html`, 200 `{not json}`, 200 JSON array → `searxng_http`, run blocked, even with vault FTS stubs returning notes. 302 fixture: `Location` to another private host; assert exactly one HTTP request.
 - Orchestrator: force the typed search exception through `execute_run`’s generic handler; manifest `blocked_on` is `search` (not `host-error`) and `blocked_reason` is preserved.
 - Resume after `searxng_http` / unconfigured (no durable result): completed fetch `task_id` not replayed; search `task_id` HTTP once more; after URL repair, unconfigured block clears and search runs; HTTP client still does not retry 500s inside one attempt.
-- Recovery after successful JSON: persist `SearchCallResult` + trip row, then fail the workstation append (or crash after both appends before the success checkpoint). Resume: **one HTTP request total** across original attempt and recovery; identical `event_id` rows; original hits returned to the model; no extra JSONL line. Concurrent appends: unique `event_id`s; duplicates collapse. Failed `searxng_http` writes no success row and no durable result.
+- Recovery after successful JSON: persist `SearchCallResult` + trip row, then fail the workstation append (or crash after both appends before the success checkpoint). Resume: **one HTTP request total** across original attempt and recovery; identical `event_id` rows; original hits returned to the model; no extra JSONL line. Concurrent appends: unique `event_id`s; duplicates collapse. Failed `searxng_http` writes no success row and no durable result. Truncated JSONL tail (`{"event_id":"r:t` with no close) then recover: the recovered event is parseable exactly once; no second HTTP.
+- `hpr install` on a **new** vault writes `searxng`/`crawl4ai`. `hpr install` on an **existing** vault that already saved `search_provider=none` and `fetch_provider=builtin` leaves those values.
+- `execute_run(..., resume=True)` on a run already `blocked_on=budget` (or `verify` / `cite-check` / `independence`) with invalid SearXNG config does **not** change `blocked_on` to `search`.
 - SSRF: search does not fetch a model URL; fetch still refuses private literals unless allowlisted on **fetch** settings.
 - Injected `search_fn` still short-circuits.
 - Live: skip unless mark `searxng_live` **and** `HYPERRESEARCH_LIVE_SEARXNG=1` **and** `SEARXNG_URL`. Default pytest collection does not select it. Assert JSON object and `results` is a list.

@@ -216,9 +216,12 @@ def _repair_jsonl_tail(path: Path) -> None:
         kept = text[:last_end]
         if kept and not kept.endswith("\n"):
             kept += "\n"
-        path.write_text(kept, encoding="utf-8")
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(kept, encoding="utf-8")
+        os.replace(tmp, path)
     elif last_end and not text.endswith("\n"):
-        path.write_text(text[:last_end] + "\n", encoding="utf-8")
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write("\n")
 
 
 def append_trip_row(path: Path, row: dict[str, Any]) -> None:

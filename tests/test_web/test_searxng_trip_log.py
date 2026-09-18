@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import httpx
 import pytest
@@ -208,3 +210,104 @@ def test_truncated_trip_log_recovery_no_http(tmp_vault, tmp_path, monkeypatch) -
     assert seen == [1]
     parsed = [json.loads(line) for line in ws.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert [p["event_id"] for p in parsed] == ["r-t:t"]
+
+def test_append_missing_newline_does_not_rewrite_prefix(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "t.jsonl"
+    row = {"event_id": "r:t", "ts": "t", "run_id": "r", "hits": 0, "unresponsive_engines": []}
+    prefix = json.dumps(row, sort_keys=True)
+    path.write_text(prefix, encoding="utf-8")
+    ino = path.stat().st_ino
+    real_open = Path.open
+
+    def guard(self, *args, **kwargs):
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if self.resolve() == path.resolve() and "w" in mode and "a" not in mode:
+            raise OSError("live JSONL must not open truncating")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guard)
+    append_trip_row(path, row)
+    assert path.stat().st_ino == ino
+    assert path.read_bytes() == (prefix + "\n").encode("utf-8")
+
+
+def test_trip_log_repair_failure_preserves_prior_events(tmp_vault, tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("SEARXNG_URL", raising=False)
+    tmp_vault.config.search_provider = "searxng"
+    tmp_vault.config.searxng_url = "http://127.0.0.1:8888"
+    ws = tmp_path / "ws.jsonl"
+    tmp_vault.config.searxng_trip_log = str(ws)
+    init_run(tmp_vault, "r-p2")
+    prior = {
+        "event_id": "prior:1",
+        "ts": "t",
+        "run_id": "prior",
+        "hits": 0,
+        "unresponsive_engines": [],
+    }
+    ws.write_text(json.dumps(prior, sort_keys=True) + "\n", encoding="utf-8")
+    seen: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(1)
+        return httpx.Response(200, json={"results": [_hit()]})
+
+    ex = HostExecutor(
+        vault=tmp_vault,
+        workspace_root=tmp_vault.root,
+        run_tag="r-p2",
+        httpx_transport=httpx.MockTransport(handler),
+    )
+    action = HostAction(kind="search", args={"query": "q"}, reason="x")
+    first = ex.execute(action, task_id="cur")
+    assert first["ok"] is True
+    assert seen == [1]
+    ws.write_text(
+        json.dumps(prior, sort_keys=True) + "\n" + '{"event_id":"r-p2:cur"',
+        encoding="utf-8",
+    )
+
+    live = ws.resolve()
+    armed = {"n": 1}
+    real_open = Path.open
+    real_replace = os.replace
+    real_truncate = os.truncate
+
+    def open_wrap(self, *args, **kwargs):
+        mode = args[0] if args else kwargs.get("mode", "r")
+        fh = real_open(self, *args, **kwargs)
+        if armed["n"] and self.resolve() == live and "w" in mode and "a" not in mode:
+            armed["n"] -= 1
+            fh.close()
+            raise OSError("injected repair failure")
+        return fh
+
+    def replace_wrap(src, dst, *args, **kwargs):
+        if armed["n"] and Path(dst).resolve() == live:
+            armed["n"] -= 1
+            raise OSError("injected repair failure")
+        return real_replace(src, dst, *args, **kwargs)
+
+    def truncate_wrap(path, length):
+        target = None if isinstance(path, int) else Path(path).resolve()
+        if armed["n"] and target == live:
+            armed["n"] -= 1
+            raise OSError("injected repair failure")
+        return real_truncate(path, length)
+
+    monkeypatch.setattr(Path, "open", open_wrap)
+    monkeypatch.setattr(os, "replace", replace_wrap)
+    monkeypatch.setattr(os, "truncate", truncate_wrap)
+
+    with pytest.raises(SearchBlockError) as ei:
+        ex.execute(action, task_id="cur")
+    assert ei.value.blocked_reason == "searxng_trip_log"
+    assert seen == [1]
+    assert "prior:1" in ws.read_text(encoding="utf-8")
+
+    armed["n"] = 0
+    second = ex.execute(action, task_id="cur")
+    assert second["ok"] is True
+    assert seen == [1]
+    parsed = [json.loads(line) for line in ws.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert [p["event_id"] for p in parsed] == ["prior:1", "r-p2:cur"]

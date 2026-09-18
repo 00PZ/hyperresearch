@@ -238,7 +238,14 @@ class HostExecutor:
         cfg = getattr(self.vault, "config", None)
         provider = getattr(cfg, "search_provider", "none") or "none"
         if provider == "none":
-            return self._search_ok(task_id, query, vault_hits, [], [])
+            return self._search_ok(
+                task_id,
+                query,
+                vault_hits,
+                [],
+                [],
+                hint="Provider cannot web-search. Propose fetch actions with https URLs.",
+            )
         if provider != "searxng":
             self._block_search("searxng_config")
 
@@ -291,15 +298,15 @@ class HostExecutor:
         vault_hits: list[Any],
         web_hits: list[Any],
         engines: list[Any],
+        *,
+        hint: str | None = None,
     ) -> dict[str, Any]:
         payload = {
             "vault_hits": vault_hits,
             "web_hits": web_hits,
             "web_error": None,
             "unresponsive_engines": engines,
-            "hint": None
-            if web_hits
-            else "Provider cannot web-search. Propose fetch actions with https URLs.",
+            "hint": hint,
         }
         digest = hashlib.sha256(repr(payload).encode()).hexdigest()[:16]
         return {

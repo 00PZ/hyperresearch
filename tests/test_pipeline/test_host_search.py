@@ -113,6 +113,52 @@ def test_empty_serp_continues_and_writes_trip_row(tmp_vault, tmp_path, monkeypat
     assert row["hits"] == 0
 
 
+def test_empty_serp_hint_is_none(tmp_vault, tmp_path, monkeypatch) -> None:
+    _cfg(tmp_vault, tmp_path, monkeypatch)
+    init_run(tmp_vault, "r-hint")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": []})
+
+    result = _ex(tmp_vault, "r-hint", handler).execute(_action("q"), task_id="ha-hint")
+    assert result["ok"] is True
+    assert result["results"]["web_hits"] == []
+    assert result["results"]["hint"] is None
+
+
+def test_hits_plus_unresponsive_hint_is_none(tmp_vault, tmp_path, monkeypatch) -> None:
+    _cfg(tmp_vault, tmp_path, monkeypatch)
+    init_run(tmp_vault, "r-mix")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "results": [{"url": "https://example.com/a", "title": "A", "content": "b"}],
+                "unresponsive_engines": [["google", "CAPTCHA"]],
+            },
+        )
+
+    result = _ex(tmp_vault, "r-mix", handler).execute(_action("q"), task_id="ha-mix")
+    assert result["ok"] is True
+    assert result["results"]["web_hits"]
+    assert result["results"]["unresponsive_engines"] == [["google", "CAPTCHA"]]
+    assert result["results"]["hint"] is None
+
+
+def test_none_provider_uses_cannot_web_search_hint(seeded_vault, monkeypatch) -> None:
+    monkeypatch.delenv("SEARXNG_URL", raising=False)
+    seeded_vault.config.search_provider = "none"
+    result = HostExecutor(vault=seeded_vault, workspace_root=seeded_vault.root).execute(
+        _action("python async"), task_id="t-hint-none"
+    )
+    assert result["ok"] is True
+    assert result["results"]["web_hits"] == []
+    assert result["results"]["hint"] == (
+        "Provider cannot web-search. Propose fetch actions with https URLs."
+    )
+
+
 def test_empty_serp_all_unresponsive_continues(tmp_vault, tmp_path, monkeypatch) -> None:
     _cfg(tmp_vault, tmp_path, monkeypatch)
     init_run(tmp_vault, "r-unr")

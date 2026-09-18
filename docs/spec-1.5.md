@@ -2,7 +2,7 @@
 
 Implementer contract. Do not re-grill the JSON/HTML lock, the host-search seam, or the trip-log split. Do not implement until the operator says `go`.
 
-**Revision 1.5.2:** persist the complete `SearchCallResult` before trip-log appends; one rule for null/non-string title and content. Architecture unchanged. 1.5.1 (SearchCallResult, config migration, `blocked_on=search`, `event_id`, no redirects) still holds.
+**Revision 1.5.3:** on successful SearXNG JSON (including empty SERP), host `hint` is `None` — do not reuse the crawl4ai “cannot web-search” string. 1.5.2 durable `SearchCallResult` / title-content rule still holds.
 
 Tracker: `/opt/data/.scratch/hyperresearch-fork/`
 Glossary: `CONTEXT.md`
@@ -125,7 +125,7 @@ class SearchCallResult:
 - `unresponsive_engines`: absent → `[]`. Present but not a list → `searxng_http`. List entries that are not a two-element sequence with a non-empty string engine are dropped from diagnostics; they do not fail the search.
 - Result entries (one rule): skip non-objects; skip if `url` is missing, null, non-string, or empty after strip. **Retain** otherwise-valid hits. `title` and `content`: `str` kept; `null` → `""`; any other type → `""`. Never slice a non-string. Dedup by URL first-wins. **Then** apply `limit`. Do not issue a second HTTP request to backfill. Returning fewer than `limit` after filtering is success.
 - `searxng_http` fails the **run** (`blocked_on=search`, `blocked_reason=searxng_http`) even when vault FTS returned notes. Do not convert that into `web_error` plus `ok: true`.
-- Empty SERP: HTTP 200, JSON object, `results` is `[]` → search action `ok: true`, `hits: []`, run continues. **Also continue when `unresponsive_engines` names every engine and `results` is `[]`.** That is success, not `searxng_http`.
+- Empty SERP: HTTP 200, JSON object, `results` is `[]` → search action `ok: true`, `hits: []`, run continues. **Also continue when `unresponsive_engines` names every engine and `results` is `[]`.** That is success, not `searxng_http`. Host payload `hint` is `None` on any successful SearXNG JSON (hits or empty). The string `Provider cannot web-search. Propose fetch actions with https URLs.` is only for `search_provider=none`.
 - Host hit shape stays `url` / `title` / `snippet` (snippet from `content`, cap 500).
 - Failure propagation: raise a typed search-block exception that carries `blocked_on="search"` and `blocked_reason`. Persist those manifest fields **before** the exception leaves the host action. `execute_run`’s generic `except Exception: _block_if_still_running(...)` (default `host-error`) must not overwrite a persisted search block. If the typed exception reaches that handler with the run still `running`, the handler must persist `blocked_on=search` (not `host-error`). Do not overwrite an already-persisted `blocked_on` of `budget`, `verify`, `cite-check`, or `independence`.
 - No automatic HTTP retry ≠ no operator resume. `hpr run resume` re-reads config/env and skips host actions whose `task_id` is terminal success. Re-query SearXNG only when that `task_id` has **no** durable `SearchCallResult` (true `searxng_http` / unconfigured). If still unconfigured, stay `blocked_on=search` without replaying completed steps. If a durable result exists, resume must **not** HTTP.
@@ -172,7 +172,7 @@ Good tests assert external behaviour: which provider is called on `search` vs `f
 - Host search `searxng`: does not call fetch-provider `search()`. Vault hits still present on success. Zero hits still carry `unresponsive_engines` on the call result.
 - Mock 200 JSON with hits → mapped; snippet ≤ 500; URL dedup first-wins after filtering.
 - Malformed entries: skip non-objects and missing/non-string/blank URLs; **keep** hits whose title/content is null or a non-string, normalized to `""`; then `limit` on survivors.
-- Mock 200 JSON `results: []` → `ok: true`, run not blocked, trip row with `hits: 0`.
+- Mock 200 JSON `results: []` → `ok: true`, run not blocked, trip row with `hits: 0`, `hint` is `None` (not the crawl4ai cannot-web-search string).
 - Mock 200 JSON `results: []` and every engine in `unresponsive_engines` → `ok: true`, run not blocked, trip row includes those engines. Not `searxng_http`.
 - Mock 200 JSON with hits plus `unresponsive_engines` → `ok: true`, row persisted.
 - Mock 500, 403, 302, timeout, DNS, 200 `text/html`, 200 `{not json}`, 200 JSON array → `searxng_http`, run blocked, even with vault FTS stubs returning notes. 302 fixture: `Location` to another private host; assert exactly one HTTP request.

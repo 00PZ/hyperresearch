@@ -185,7 +185,8 @@ def load_search_call(run_dir: Path, task_id: str) -> dict[str, Any] | None:
     path = search_call_path(run_dir, task_id)
     if not path.exists():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    data: Any = json.loads(path.read_text(encoding="utf-8"))
+    return data if isinstance(data, dict) else None
 
 
 def append_trip_row(path: Path, row: dict[str, Any]) -> None:

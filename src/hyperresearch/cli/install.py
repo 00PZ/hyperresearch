@@ -179,6 +179,9 @@ def install(
         hook_actions = install_hooks(root, hpr_path=hpr_path, profile=project_profile)
     # Step 3: Auto-configure crawl4ai if installed
     crawl4ai_status = _setup_crawl4ai(vault)
+    vault.config.search_provider = "searxng"
+    vault.config.web_provider = "crawl4ai"
+    vault.config.save(vault.config_path)
 
     # Step 5: Report
     data = {

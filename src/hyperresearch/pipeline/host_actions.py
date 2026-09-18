@@ -10,7 +10,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 from urllib.parse import urlparse
 
 from hyperresearch.core.profiles import Profile
@@ -18,7 +18,7 @@ from hyperresearch.core.runs import add_spend, load_manifest, set_status
 from hyperresearch.core.vault import Vault
 from hyperresearch.pipeline.checkpoints import TaskLog, dump_agent_result
 from hyperresearch.pipeline.patch import content_hash
-from hyperresearch.runtime.errors import IllegalHostAction, UncertainSubmission
+from hyperresearch.runtime.errors import IllegalHostAction, SearchBlockError, UncertainSubmission
 from hyperresearch.runtime.parse import assert_action_allowed, iter_host_actions
 from hyperresearch.runtime.types import (
     AgentResult,
@@ -197,6 +197,7 @@ class HostExecutor:
     spent_usd: float = 0.0
     fetches: list[str] = field(default_factory=list)
     run_tag: str = ""
+    httpx_transport: Any = None
 
     def execute(self, action: HostAction, *, task_id: str) -> dict[str, Any]:
         if action.kind == "complete":
@@ -233,23 +234,69 @@ class HostExecutor:
             vault_hits = list(search_fts(self.vault.db, query, limit=limit) or [])
         except Exception as e:
             vault_hits = [{"error": str(e)}]
-        web_hits: list[Any] = []
-        web_error: str | None = None
-        try:
-            from hyperresearch.pipeline.prompts import web_hit
-            from hyperresearch.web.base import get_provider
 
-            provider_name = getattr(getattr(self.vault, "config", None), "web_provider", None)
-            prov = get_provider(provider_name)
-            web_hits = [web_hit(item) for item in prov.search(query, max_results=limit)]
-        except NotImplementedError as e:
-            web_error = str(e)
-        except Exception as e:
-            web_error = str(e)
+        cfg = getattr(self.vault, "config", None)
+        provider = getattr(cfg, "search_provider", "none") or "none"
+        if provider == "none":
+            return self._search_ok(task_id, query, vault_hits, [], [])
+        if provider != "searxng":
+            self._block_search("searxng_config")
+
+        from hyperresearch.pipeline.prompts import web_hit
+        from hyperresearch.web.searxng import (
+            RUN_TRIP_LOG_NAME,
+            dual_write_trip,
+            invalid_searxng_url_reason,
+            load_search_call,
+            resolve_searxng_url,
+            save_search_call,
+            searxng_search,
+            trip_log_path,
+            trip_row_for,
+        )
+
+        run_dir = self.vault.run_dir(self.run_tag) if self.run_tag else None
+        if run_dir is not None:
+            rec = load_search_call(run_dir, task_id)
+            if rec is not None:
+                self._repair_trip(rec["trip_row"])
+                web_hits = [web_hit(item) for item in rec.get("hits") or []]
+                engines = rec.get("unresponsive_engines") or []
+                return self._search_ok(task_id, query, vault_hits, web_hits, engines)
+
+        url = resolve_searxng_url(cfg)
+        reason = invalid_searxng_url_reason(url)
+        if reason:
+            self._block_search(reason)
+
+        try:
+            call = searxng_search(url, query, limit, transport=self.httpx_transport)
+        except SearchBlockError as exc:
+            self._block_search(exc.blocked_reason)
+
+        web_hits = [web_hit(item) for item in call.hits]
+        if run_dir is not None:
+            trip = trip_row_for(self.run_tag, task_id, call)
+            save_search_call(run_dir, task_id, call, trip)
+            try:
+                dual_write_trip(run_dir / RUN_TRIP_LOG_NAME, trip_log_path(cfg), trip)
+            except SearchBlockError as exc:
+                self._block_search(exc.blocked_reason)
+        return self._search_ok(task_id, query, vault_hits, web_hits, call.unresponsive_engines)
+
+    def _search_ok(
+        self,
+        task_id: str,
+        query: str,
+        vault_hits: list[Any],
+        web_hits: list[Any],
+        engines: list[Any],
+    ) -> dict[str, Any]:
         payload = {
             "vault_hits": vault_hits,
             "web_hits": web_hits,
-            "web_error": web_error,
+            "web_error": None,
+            "unresponsive_engines": engines,
             "hint": None
             if web_hits
             else "Provider cannot web-search. Propose fetch actions with https URLs.",
@@ -258,11 +305,42 @@ class HostExecutor:
         return {
             "task_id": task_id,
             "kind": "search",
-            "ok": bool(web_hits or vault_hits) or web_error is None,
+            "ok": True,
             "query": query,
             "results": payload,
             "content_hash": digest,
         }
+
+    def _repair_trip(self, trip_row: dict[str, Any]) -> None:
+        if not self.run_tag:
+            return
+        from hyperresearch.web.searxng import RUN_TRIP_LOG_NAME, dual_write_trip, trip_log_path
+
+        try:
+            dual_write_trip(
+                self.vault.run_dir(self.run_tag) / RUN_TRIP_LOG_NAME,
+                trip_log_path(self.vault.config),
+                trip_row,
+            )
+        except SearchBlockError as exc:
+            self._block_search(exc.blocked_reason)
+
+    def _block_search(self, reason: str) -> NoReturn:
+        protected = {"budget", "verify", "cite-check", "independence"}
+        if self.run_tag:
+            try:
+                live = load_manifest(self.vault, self.run_tag)
+            except Exception:
+                live = {"status": "running"}
+            if live.get("blocked_on") not in protected and live.get("status") == "running":
+                set_status(
+                    self.vault,
+                    self.run_tag,
+                    "blocked",
+                    blocked_on="search",
+                    blocked_reason=reason,
+                )
+        raise SearchBlockError(reason)
 
     def _fetch(self, action: HostAction, task_id: str) -> dict[str, Any]:
         url = str(action.args.get("url") or "").strip()

@@ -7,6 +7,12 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 
+def default_searxng_trip_log() -> str:
+    from platformdirs import user_data_path
+
+    return str(user_data_path("hyperresearch") / "searxng-trip.jsonl")
+
+
 @dataclass(frozen=True)
 class FetchSettings:
     """Network/browser behavior for web fetching ([fetch] section)."""
@@ -234,8 +240,12 @@ class VaultConfig:
         ]
     )
 
-    # Web provider
+    # Web: search_provider is none|searxng; web_provider is the fetch backend
+    # (TOML key fetch_provider; deprecated alias provider).
     web_provider: str = "builtin"
+    search_provider: str = "none"
+    searxng_url: str = ""
+    searxng_trip_log: str = field(default_factory=default_searxng_trip_log)
     web_profile: str = ""  # crawl4ai browser profile name (created via `crwl profiles`)
     web_magic: bool = False  # crawl4ai magic mode (anti-bot stealth)
 
@@ -291,7 +301,12 @@ class VaultConfig:
             search_default_limit=search.get("default_limit", cls.search_default_limit),
             search_chars_per_token=search.get("chars_per_token", cls.search_chars_per_token),
             search_snippet_len=search.get("snippet_len", cls.search_snippet_len),
-            web_provider=web.get("provider", cls.web_provider),
+            web_provider=(
+                web["fetch_provider"] if "fetch_provider" in web else web.get("provider", cls.web_provider)
+            ),
+            search_provider=web.get("search_provider", cls.search_provider),
+            searxng_url=web.get("searxng_url", ""),
+            searxng_trip_log=web.get("searxng_trip_log", default_searxng_trip_log()),
             web_profile=web.get("profile", cls.web_profile),
             web_magic=web.get("magic", cls.web_magic),
             pipeline_profile=pipeline.get("profile", cls.pipeline_profile),
@@ -357,7 +372,10 @@ class VaultConfig:
             f"snippet_len = {self.search_snippet_len}",
             "",
             "[web]",
-            f'provider = "{self.web_provider}"',
+            f'search_provider = "{self.search_provider}"',
+            f'fetch_provider = "{self.web_provider}"',
+            f'searxng_url = "{self.searxng_url}"',
+            f'searxng_trip_log = "{self.searxng_trip_log}"',
             f'profile = "{self.web_profile}"',
             f"magic = {'true' if self.web_magic else 'false'}",
             "",

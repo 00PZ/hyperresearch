@@ -238,3 +238,16 @@ def test_block_if_still_running_does_not_overwrite_verify(tmp_vault) -> None:
     set_status(tmp_vault, "r-ver", "blocked", blocked_on="verify")
     _block_if_still_running(tmp_vault, "r-ver", blocked_on="search", blocked_reason="searxng_http")
     assert load_manifest(tmp_vault, "r-ver")["blocked_on"] == "verify"
+
+
+def test_execute_run_start_gate_preserves_budget_block(tmp_vault, monkeypatch) -> None:
+    monkeypatch.delenv("SEARXNG_URL", raising=False)
+    tmp_vault.config.search_provider = "searxng"
+    tmp_vault.config.searxng_url = ""
+    init_run(tmp_vault, "r-bud")
+    set_status(tmp_vault, "r-bud", "blocked", blocked_on="budget")
+    result = run(
+        execute_run(tmp_vault, "What is X?", _rt(), profile="light", tag="r-bud", resume=True)
+    )
+    assert result["manifest"]["blocked_on"] == "budget"
+    assert load_manifest(tmp_vault, "r-bud")["blocked_on"] == "budget"

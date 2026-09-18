@@ -1063,6 +1063,17 @@ async def execute_run(
     gate = validate_search_config(vault.config)
     live0 = load_manifest(vault, run_tag)
     if gate:
+        if live0.get("status") == "blocked" and live0.get("blocked_on") in {
+            "budget",
+            "verify",
+            "cite-check",
+            "independence",
+        }:
+            return {
+                "manifest": live0,
+                "verify": {"passed": False, "blocked_on": live0.get("blocked_on")},
+                "tag": run_tag,
+            }
         set_status(vault, run_tag, "blocked", blocked_on="search", blocked_reason=gate)
         return {
             "manifest": load_manifest(vault, run_tag),

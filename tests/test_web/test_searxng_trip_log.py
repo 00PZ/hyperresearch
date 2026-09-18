@@ -168,3 +168,43 @@ def test_searxng_search_not_used_on_http_failure_row() -> None:
             "q",
             client=httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False),
         )
+
+
+def test_append_repairs_truncated_jsonl_tail(tmp_path) -> None:
+    path = tmp_path / "t.jsonl"
+    path.write_text('{"event_id":"r:t', encoding="utf-8")
+    row = {"event_id": "r:t", "ts": "t", "run_id": "r", "hits": 0, "unresponsive_engines": []}
+    append_trip_row(path, row)
+    parsed = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert [p["event_id"] for p in parsed] == ["r:t"]
+
+
+def test_truncated_trip_log_recovery_no_http(tmp_vault, tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("SEARXNG_URL", raising=False)
+    tmp_vault.config.search_provider = "searxng"
+    tmp_vault.config.searxng_url = "http://127.0.0.1:8888"
+    ws = tmp_path / "ws.jsonl"
+    tmp_vault.config.searxng_trip_log = str(ws)
+    init_run(tmp_vault, "r-t")
+    seen: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(1)
+        return httpx.Response(200, json={"results": [_hit()]})
+
+    ex = HostExecutor(
+        vault=tmp_vault,
+        workspace_root=tmp_vault.root,
+        run_tag="r-t",
+        httpx_transport=httpx.MockTransport(handler),
+    )
+    action = HostAction(kind="search", args={"query": "q"}, reason="x")
+    first = ex.execute(action, task_id="t")
+    assert first["ok"] is True
+    assert seen == [1]
+    ws.write_text('{"event_id":"r:t', encoding="utf-8")
+    second = ex.execute(action, task_id="t")
+    assert second["ok"] is True
+    assert seen == [1]
+    parsed = [json.loads(line) for line in ws.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert [p["event_id"] for p in parsed] == ["r-t:t"]

@@ -179,9 +179,10 @@ def install(
         hook_actions = install_hooks(root, hpr_path=hpr_path, profile=project_profile)
     # Step 3: Auto-configure crawl4ai if installed
     crawl4ai_status = _setup_crawl4ai(vault)
-    vault.config.search_provider = "searxng"
-    vault.config.web_provider = "crawl4ai"
-    vault.config.save(vault.config_path)
+    if vault_action == "created":
+        vault.config.search_provider = "searxng"
+        vault.config.web_provider = "crawl4ai"
+        vault.config.save(vault.config_path)
 
     # Step 5: Report
     data = {
@@ -227,7 +228,7 @@ def install(
 
 
 def _setup_crawl4ai(vault) -> str:
-    """Detect crawl4ai, install browser if needed, set as default provider.
+    """Detect crawl4ai, install browser if needed.
 
     Returns: 'configured' (already ready), 'browser_installed' (just set up),
              'not_installed' (crawl4ai not available).
@@ -236,11 +237,6 @@ def _setup_crawl4ai(vault) -> str:
         import crawl4ai  # noqa: F401
     except ImportError:
         return "not_installed"
-
-    # Set crawl4ai as the default provider if still on builtin
-    if vault.config.web_provider == "builtin":
-        vault.config.web_provider = "crawl4ai"
-        vault.config.save(vault.config_path)
 
     # Check if the browser is already installed -- against the stack the
     # provider will actually launch: patchright (stealth adapter) pins its

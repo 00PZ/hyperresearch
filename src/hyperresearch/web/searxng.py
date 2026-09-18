@@ -189,11 +189,44 @@ def load_search_call(run_dir: Path, task_id: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def _repair_jsonl_tail(path: Path) -> None:
+    if not path.exists():
+        return
+    text = path.read_text(encoding="utf-8")
+    if not text:
+        return
+    decoder = json.JSONDecoder()
+    idx = 0
+    last_end = 0
+    n = len(text)
+    truncated = False
+    while idx < n:
+        while idx < n and text[idx].isspace():
+            idx += 1
+        if idx >= n:
+            break
+        try:
+            _, end = decoder.raw_decode(text, idx)
+        except json.JSONDecodeError:
+            truncated = True
+            break
+        last_end = end
+        idx = end
+    if truncated:
+        kept = text[:last_end]
+        if kept and not kept.endswith("\n"):
+            kept += "\n"
+        path.write_text(kept, encoding="utf-8")
+    elif last_end and not text.endswith("\n"):
+        path.write_text(text[:last_end] + "\n", encoding="utf-8")
+
+
 def append_trip_row(path: Path, row: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + ".lock")
     with open(lock_path, "a", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        _repair_jsonl_tail(path)
         event_id = row.get("event_id")
         if event_id and path.exists():
             for line in path.read_text(encoding="utf-8").splitlines():

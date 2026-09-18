@@ -123,3 +123,23 @@ def test_install_writes_explicit_search_and_fetch_providers(tmp_path, monkeypatc
     assert 'search_provider = "searxng"' in web
     assert 'fetch_provider = "crawl4ai"' in web
     assert "\nprovider =" not in web
+
+
+def test_install_preserves_existing_provider_choices(tmp_path, monkeypatch) -> None:
+    from typer.testing import CliRunner
+
+    from hyperresearch.cli import app
+    from hyperresearch.core.vault import Vault
+
+    monkeypatch.chdir(tmp_path)
+    vault = Vault.init(tmp_path, name="T")
+    vault.config.search_provider = "none"
+    vault.config.web_provider = "builtin"
+    vault.config.save(vault.config_path)
+    vault.close()
+
+    result = CliRunner().invoke(app, ["install", str(tmp_path), "--json"])
+    assert result.exit_code == 0, result.output
+    cfg = VaultConfig.load(tmp_path / ".hyperresearch" / "config.toml")
+    assert cfg.search_provider == "none"
+    assert cfg.web_provider == "builtin"

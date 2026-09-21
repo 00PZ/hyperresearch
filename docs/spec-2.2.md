@@ -2,7 +2,7 @@
 
 Implementer contract. Do not re-grill Spec 1 (host pipeline, ModelRuntime, no wiki-write in the fork) or Spec 1.5 (SearXNG JSON search, crawl4ai fetch). Spec 2.1 (company workflow inside `hpr`) is superseded. Do not implement until the operator says `go`.
 
-**Revision 2.2.4:** Full company FakeRuntime independence is pinned to known-distinct provenance; empty-provenance snapshots do not increment the count.
+**Revision 2.2.5:** Worker harvest is in Required Suites (`hr-workflow harvest-gaps`): two Open-gaps lines → two pending items; re-harvest adds none; empty Gaps → zero.
 
 Tracker: `/opt/data/.scratch/hyperresearch-fork/`
 Glossary: `CONTEXT.md`
@@ -326,6 +326,7 @@ Split suites so core cannot pass by importing GBrain or Paperclip.
 - Queue `running` + not `verified` → invoke `hpr` resume for that `run_id`, no second id.
 - Queue `verified` + complete package + publication not `ok` → no ModelRuntime.
 - Light-tier `completed` package: worker does not publish and does not POST Librarian.
+- `hr-workflow harvest-gaps --company shoshin` on a fixture wiki page with two Open-gaps lines → two pending `origin=wiki-gap` items; re-harvest adds none; empty Gaps heading → zero items. Takes the company lock (second process fail-immediately).
 - Drain of `running` + `package.status=invalid` does **not** rebuild and does **not** start `hpr`; explicit rebuild command may rebuild once.
 - Skip report `put_page` only when remote body hash equals the envelope frozen published hash; engine `package_digest` equal is not sufficient if published bytes differ.
 - Conflict: remote body hash ≠ envelope frozen published bytes → `publication.reason=conflict`, remote unchanged.

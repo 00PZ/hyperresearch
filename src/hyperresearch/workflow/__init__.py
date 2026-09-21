@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -13,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from hyperresearch.pipeline.knowledge import SHOSHIN_WIKI_PREFIX
 from hyperresearch.pipeline.package import PackageError, package_path, validate_package
 
 REPORT_PREFIX = "companies/shoshin/research/reports/"
@@ -344,6 +346,123 @@ def wiki_draft(gbrain: Any, research_slug: str) -> str:
     page = gbrain.get_page(research_slug)
     body = page.get("body") if isinstance(page, dict) else page
     return str(body or "")
+
+
+_LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.*)$")
+_DASH_ONLY = re.compile(r"^[\-\u2013\u2014\u2212*·.\s]+$")
+_SKU = re.compile(r"^sku\b", re.I)
+
+
+def _list_pages(gbrain: Any, **kwargs: Any) -> list[dict[str, Any]]:
+    result = gbrain.list_pages(**kwargs)
+    if isinstance(result, list):
+        return [p for p in result if isinstance(p, dict)]
+    if isinstance(result, dict):
+        for key in ("pages", "hits", "results", "items"):
+            value = result.get(key)
+            if isinstance(value, list):
+                return [p for p in value if isinstance(p, dict)]
+    return []
+
+
+def _page_item(page: dict[str, Any]) -> dict[str, Any]:
+    raw = page.get("body")
+    return {**page, **raw} if isinstance(raw, dict) else page
+
+
+def _page_text(gbrain: Any, page: dict[str, Any]) -> str:
+    body = page.get("body")
+    if isinstance(body, str) and body:
+        return body
+    if isinstance(body, dict):
+        text = body.get("body") or body.get("content")
+        if text:
+            return str(text)
+    slug = str(page.get("slug") or "")
+    if not slug:
+        return ""
+    fetched = gbrain.get_page(slug)
+    if isinstance(fetched, str):
+        return fetched
+    if not isinstance(fetched, dict):
+        return str(fetched or "")
+    inner = fetched.get("body")
+    if isinstance(inner, str):
+        return inner
+    if isinstance(inner, dict):
+        return str(inner.get("body") or inner.get("content") or "")
+    return str(fetched.get("content") or "")
+
+
+def _skip_gap(text: str, wiki_slug: str) -> bool:
+    if not text or _DASH_ONLY.fullmatch(text):
+        return True
+    if _SKU.match(text):
+        return True
+    return "primer" in wiki_slug.lower() and " " not in text
+
+
+def _parse_wiki_gaps(body: str, wiki_slug: str = "") -> list[str]:
+    items: list[str] = []
+    in_section = False
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            name = stripped.lstrip("#").strip().rstrip(":").lower()
+            in_section = name in {"open-gaps", "gaps"}
+            continue
+        if not in_section:
+            continue
+        match = _LIST_ITEM.match(line)
+        if not match:
+            continue
+        text = match.group(1).strip()
+        if _skip_gap(text, wiki_slug):
+            continue
+        items.append(text)
+    return items
+
+
+def harvest_gaps(*, company: str, gbrain: Any, lock_path: Path) -> dict[str, Any]:
+    if company != "shoshin":
+        raise WorkflowError("unknown company", code=1)
+    try:
+        with company_lock(lock_path):
+            return _harvest_locked(gbrain)
+    except LockHeldError:
+        raise WorkflowError("lock held", code=1) from None
+
+
+def _harvest_locked(gbrain: Any) -> dict[str, Any]:
+    existing: set[str] = set()
+    for page in _list_pages(gbrain, prefix=QUEUE_PREFIX):
+        digest = str(_page_item(page).get("dedup_hash") or "")
+        if digest:
+            existing.add(digest)
+    added: list[dict[str, Any]] = []
+    for page in _list_pages(gbrain, prefix=SHOSHIN_WIKI_PREFIX):
+        item = _page_item(page)
+        slug = str(page.get("slug") or item.get("slug") or "")
+        if not slug.startswith(SHOSHIN_WIKI_PREFIX):
+            continue
+        if str(item.get("type") or "") != "wiki":
+            continue
+        for gap_text in _parse_wiki_gaps(_page_text(gbrain, page), slug):
+            digest = _sha(f"{slug}{gap_text}".encode())
+            if digest in existing:
+                continue
+            existing.add(digest)
+            payload = {
+                "origin": "wiki-gap",
+                "query": gap_text,
+                "status": "pending",
+                "wiki_slug": slug,
+                "gap_text": gap_text,
+                "dedup_hash": digest,
+            }
+            gbrain.put_page(f"{QUEUE_PREFIX}{digest}", type="research-queue", **payload, body=payload)
+            added.append(payload)
+    return {"ok": True, "added": len(added), "items": added}
 
 
 def drain(

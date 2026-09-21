@@ -19,6 +19,7 @@ the quality composite.
 from __future__ import annotations
 
 import re
+from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from hyperresearch.core.similarity import jaccard, shingle
@@ -59,10 +60,10 @@ def _wire_signature(body: str, title: str) -> str | None:
 
 
 def compute_independence(
-    vault,
+    vault: Any,
     tag: str | None = None,
     note_ids: list[str] | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Cluster derivative sources, write independence scores. Returns summary."""
     conn = vault.db
     query = (
@@ -70,7 +71,7 @@ def compute_independence(
         "FROM notes n JOIN note_content nc ON nc.note_id = n.id "
         "WHERE n.source IS NOT NULL AND n.type NOT IN ('index')"
     )
-    params: tuple = ()
+    params: tuple[str, ...] = ()
     if note_ids is not None:
         wanted = [n for n in note_ids if n]
         if not wanted:
@@ -85,7 +86,7 @@ def compute_independence(
 
     # Union-find over note ids
     parent: dict[str, str] = {r["id"]: r["id"] for r in rows}
-    cluster_kind: dict[frozenset, str] = {}
+    cluster_kind: dict[frozenset[str], str] = {}
 
     def find(x: str) -> str:
         while parent[x] != x:
@@ -100,7 +101,7 @@ def compute_independence(
         cluster_kind[frozenset((a, b))] = kind
 
     # 1. Canonical-URL identity
-    by_url: dict[str, list[dict]] = {}
+    by_url: dict[str, list[dict[str, Any]]] = {}
     for r in rows:
         by_url.setdefault(canonical_url(r["source"]), []).append(r)
     for group in by_url.values():
@@ -108,7 +109,7 @@ def compute_independence(
             union(group[0]["id"], other["id"], "url")
 
     # 2. Wire-service signature
-    by_wire: dict[str, list[dict]] = {}
+    by_wire: dict[str, list[dict[str, Any]]] = {}
     for r in rows:
         sig = _wire_signature(r["body_plain"], r["title"])
         if sig:
@@ -129,11 +130,11 @@ def compute_independence(
                 union(ids[i], ids[j], "body")
 
     # Materialize clusters; root = earliest fetched (the upstream original)
-    groups: dict[str, list[dict]] = {}
+    groups: dict[str, list[dict[str, Any]]] = {}
     for r in rows:
         groups.setdefault(find(r["id"]), []).append(r)
 
-    clusters = []
+    clusters: list[dict[str, Any]] = []
     scored = 0
     for members in groups.values():
         if len(members) == 1:
@@ -162,13 +163,13 @@ def compute_independence(
     return {"scored": scored, "clusters": clusters, "audited": [r["id"] for r in rows]}
 
 
-def cluster_evidence_independence(items: list[dict]) -> dict:
+def cluster_evidence_independence(items: list[dict[str, Any]]) -> dict[str, Any]:
     """Cluster on document_id and non-empty provenance. Empty provenance is unknown.
 
     Namespace is not an independence key. Distinct empty-provenance documents
     must not increment independent_source_count.
     """
-    nodes: list[dict] = []
+    nodes: list[dict[str, Any]] = []
     for raw in items:
         nid = str(raw.get("id") or raw.get("note_id") or raw.get("document_id") or "")
         if not nid:
@@ -211,11 +212,11 @@ def cluster_evidence_independence(items: list[dict]) -> dict:
         for other in group[1:]:
             union(group[0], other)
 
-    groups: dict[str, list[dict]] = {}
+    groups: dict[str, list[dict[str, Any]]] = {}
     for n in nodes:
         groups.setdefault(find(n["id"]), []).append(n)
 
-    clusters = []
+    clusters: list[dict[str, Any]] = []
     independent = 0
     for members in groups.values():
         known = sorted({p for m in members for p in m["provenance"]})

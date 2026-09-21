@@ -12,6 +12,7 @@ import typer
 from hyperresearch.workflow import (
     WorkflowError,
     drain,
+    harvest_gaps,
     ingest_retry,
     wiki_draft,
 )
@@ -80,6 +81,17 @@ def drain_cmd(
             lock_path=lock_path,
             queue_pages=queue,
         )
+    except WorkflowError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(exc.code) from exc
+
+
+@app.command("harvest-gaps")
+def harvest_gaps_cmd(company: str = typer.Option(..., "--company")) -> None:
+    vault = _vault()
+    lock_path = vault.root / ".hr-workflow.lock"
+    try:
+        harvest_gaps(company=company, gbrain=_gbrain(), lock_path=lock_path)
     except WorkflowError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(exc.code) from exc

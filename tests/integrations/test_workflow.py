@@ -16,6 +16,7 @@ from hyperresearch.workflow import (
     dispatch_ingest,
     drain,
     freeze_envelope,
+    harvest_gaps,
     ingest_retry,
     load_workflow,
     publish_package,
@@ -39,6 +40,18 @@ class FakePageStore:
         body = kwargs.get("body")
         self.pages[slug] = {"slug": slug, **kwargs, "body": body}
         return self.pages[slug]
+
+    def list_pages(self, **kwargs: Any) -> list[dict[str, Any]]:
+        prefix = str(kwargs.get("prefix") or "")
+        typ = kwargs.get("type")
+        pages: list[dict[str, Any]] = []
+        for slug, page in self.pages.items():
+            if prefix and not slug.startswith(prefix):
+                continue
+            if typ and page.get("type") != typ:
+                continue
+            pages.append(page)
+        return pages
 
     def get_raw_data(self, key: str) -> bytes | None:
         return self.raw.get(key)
@@ -398,3 +411,56 @@ def test_engine_has_no_hardcoded_paperclip_uuids():
         for path in folder.rglob("*.py"):
             text += path.read_text(encoding="utf-8")
     assert "PAPERCLIP_" not in text
+
+
+_WIKI = "companies/shoshin/knowledge/wiki/topic"
+
+
+def _queue_items(gbrain: FakePageStore) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for slug, page in gbrain.pages.items():
+        if not slug.startswith("companies/shoshin/research/queue/"):
+            continue
+        raw = page.get("body")
+        items.append(raw if isinstance(raw, dict) else page)
+    return items
+
+
+def test_harvest_two_open_gaps_lines(tmp_path: Path) -> None:
+    gbrain = FakePageStore()
+    gbrain.pages[_WIKI] = {
+        "slug": _WIKI,
+        "type": "wiki",
+        "body": "## Open-gaps\n- first known hole\n- second known hole\n",
+    }
+    harvest_gaps(company="shoshin", gbrain=gbrain, lock_path=tmp_path / "co.lock")
+    items = _queue_items(gbrain)
+    assert len(items) == 2
+    assert {i["gap_text"] for i in items} == {"first known hole", "second known hole"}
+    assert all(i["origin"] == "wiki-gap" and i["status"] == "pending" for i in items)
+
+
+def test_harvest_reharvest_adds_none(tmp_path: Path) -> None:
+    gbrain = FakePageStore()
+    gbrain.pages[_WIKI] = {
+        "slug": _WIKI,
+        "type": "wiki",
+        "body": "## Open-gaps\n- first known hole\n- second known hole\n",
+    }
+    lock = tmp_path / "co.lock"
+    harvest_gaps(company="shoshin", gbrain=gbrain, lock_path=lock)
+    puts = len(gbrain.put_calls)
+    harvest_gaps(company="shoshin", gbrain=gbrain, lock_path=lock)
+    assert len(_queue_items(gbrain)) == 2
+    assert len(gbrain.put_calls) == puts
+
+
+def test_harvest_empty_gaps_zero(tmp_path: Path) -> None:
+    gbrain = FakePageStore()
+    gbrain.pages[_WIKI] = {
+        "slug": _WIKI,
+        "type": "wiki",
+        "body": "## Gaps\n\n## Other\n- not harvested\n",
+    }
+    harvest_gaps(company="shoshin", gbrain=gbrain, lock_path=tmp_path / "co.lock")
+    assert _queue_items(gbrain) == []

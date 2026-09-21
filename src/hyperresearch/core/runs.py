@@ -91,6 +91,8 @@ def init_run(
     profile: str = "full",
     budget_usd: float | None = None,
     query: str | None = None,
+    company: str | None = None,
+    knowledge_backend: str | None = None,
 ) -> dict:
     """Scaffold research/runs/<vault_tag>/ and write a fresh manifest.
 
@@ -130,7 +132,17 @@ def init_run(
             "notes_written": 0,
             "agents_spawned": 0,
         },
+        "company": company,
+        "vault_root": str(vault.root),
+        "knowledge_backend": knowledge_backend or ("none" if not company else None),
     }
+    _save(vault, vault_tag, manifest)
+    return manifest
+
+
+def patch_manifest(vault, vault_tag: str, **fields: object) -> dict:
+    manifest = load_manifest(vault, vault_tag)
+    manifest.update(fields)
     _save(vault, vault_tag, manifest)
     return manifest
 

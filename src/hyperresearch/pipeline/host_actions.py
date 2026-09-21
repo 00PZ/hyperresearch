@@ -148,6 +148,7 @@ def record_evidence(
     url: str,
     body_hash: str,
     origin: str,
+    extra: dict[str, Any] | None = None,
 ) -> None:
     sources = load_evidence(vault, tag)
     entry = {
@@ -156,6 +157,8 @@ def record_evidence(
         "content_hash": body_hash,
         "origin": origin,
     }
+    if extra:
+        entry.update(extra)
     by_id: dict[str, dict[str, Any]] = {}
     for src in sources:
         nid = str(src.get("note_id") or "")
@@ -170,12 +173,55 @@ def record_evidence(
     )
 
 
+def persist_snapshot(vault: Vault, tag: str, snap: dict[str, Any]) -> dict[str, Any]:
+    run_dir = vault.run_dir(tag)
+    sdir = run_dir / "snapshots"
+    sdir.mkdir(parents=True, exist_ok=True)
+    doc_id = str(snap.get("document_id") or snap.get("ref") or "snap")
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", doc_id)[:80] or "snap"
+    path = sdir / f"{safe}.json"
+    path.write_text(json.dumps(snap, indent=2) + "\n", encoding="utf-8")
+    record_evidence(
+        vault,
+        tag,
+        doc_id,
+        "",
+        str(snap.get("content_hash") or ""),
+        "knowledge",
+        extra={
+            "namespace": snap.get("namespace"),
+            "document_id": doc_id,
+            "type": snap.get("type"),
+            "provenance": list(snap.get("provenance") or []),
+            "snapshot_path": str(path.relative_to(run_dir)),
+            "ref": snap.get("ref"),
+        },
+    )
+    return snap
+
+
+def load_snapshots(vault: Vault, tag: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    sdir = vault.run_dir(tag) / "snapshots"
+    if not sdir.is_dir():
+        return out
+    for path in sorted(sdir.glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            out.append(data)
+    return out
+
 def evidence_content_hash(vault: Vault, tag: str) -> str:
     """Identity of selected source bytes, not of evidence-digest.md."""
     lines: list[str] = []
+    run_dir = vault.run_dir(tag)
     for src in load_evidence(vault, tag):
         note_id = str(src.get("note_id") or "")
-        npath = vault.notes_dir / f"{note_id}.md"
+        rel = src.get("snapshot_path")
+        npath = run_dir / str(rel) if rel else vault.notes_dir / f"{note_id}.md"
         body = npath.read_text(encoding="utf-8-sig") if npath.exists() else ""
         lines.append(f"{note_id}:{content_hash(body)}")
     return content_hash("\n".join(sorted(lines)))
@@ -198,6 +244,9 @@ class HostExecutor:
     fetches: list[str] = field(default_factory=list)
     run_tag: str = ""
     httpx_transport: Any = None
+    company: str | None = None
+    knowledge_backend: str = "none"
+    knowledge_reader: Any = None
 
     def execute(self, action: HostAction, *, task_id: str) -> dict[str, Any]:
         if action.kind == "complete":
@@ -227,6 +276,21 @@ class HostExecutor:
                 "results": hits,
                 "content_hash": digest,
             }
+        if self.company:
+            gap_raw = action.args.get("gap")
+            if isinstance(gap_raw, dict):
+                from hyperresearch.pipeline.gaps import upsert_gap
+
+                if not self.run_tag or upsert_gap(self.vault.run_dir(self.run_tag), gap_raw) is None:
+                    raise IllegalHostAction("invalid gap")
+            mode = str(action.args.get("mode") or "memory").strip() or "memory"
+            if mode != "web":
+                return self._memory_search(action, task_id, query, limit)
+            from hyperresearch.pipeline.gaps import accepted_gap
+
+            gap_id = str(action.args.get("gap_id") or "")
+            if not self.run_tag or accepted_gap(self.vault.run_dir(self.run_tag), gap_id) is None:
+                raise IllegalHostAction("web search requires host-accepted gap_id")
         vault_hits: list[Any] = []
         try:
             from hyperresearch.search.fts import search_fts
@@ -290,6 +354,193 @@ class HostExecutor:
             except SearchBlockError as exc:
                 self._block_search(exc.blocked_reason)
         return self._search_ok(task_id, query, vault_hits, web_hits, call.unresponsive_engines)
+
+    def _memory_search(
+        self, action: HostAction, task_id: str, query: str, limit: int
+    ) -> dict[str, Any]:
+        from datetime import UTC, datetime
+
+        from hyperresearch.pipeline.knowledge import NoneReader, snapshot_from_get
+
+        vault_hits: list[Any] = []
+        try:
+            from hyperresearch.search.fts import search_fts
+
+            vault_hits = list(search_fts(self.vault.db, query, limit=limit) or [])
+        except Exception as e:
+            vault_hits = [{"error": str(e)}]
+        reader = self.knowledge_reader or NoneReader()
+        scope = action.args.get("scope")
+        result = reader.search(query, scope=str(scope) if scope else None)
+        retrieved_at = datetime.now(UTC).isoformat()
+        if self.run_tag:
+            path = self.vault.run_dir(self.run_tag) / "knowledge-search.json"
+            path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        if not result.get("ok"):
+            digest = hashlib.sha256(repr(result).encode()).hexdigest()[:16]
+            return {
+                "task_id": task_id,
+                "kind": "search",
+                "ok": False,
+                "query": query,
+                "mode": "memory",
+                "results": {
+                    "vault_hits": vault_hits,
+                    "knowledge_hits": [],
+                    "web_hits": [],
+                    "web_error": None,
+                    "knowledge_error": result.get("error"),
+                    "memory_search": {
+                        "query": query,
+                        "scope": scope,
+                        "ok": False,
+                        "hit_count": 0,
+                        "retrieved_at": retrieved_at,
+                    },
+                },
+                "content_hash": digest,
+            }
+        hits = list(result.get("hits") or [])
+        snapshots: list[dict[str, Any]] = []
+        if self.run_tag:
+            for hit in hits:
+                ref = str(hit.get("ref") or hit.get("document_id") or "")
+                if not ref:
+                    continue
+                got = reader.get(ref)
+                if got.get("ok"):
+                    snap = snapshot_from_get(ref, got)
+                    persist_snapshot(self.vault, self.run_tag, snap)
+                    snapshots.append(snap)
+        memory_search = {
+            "query": query,
+            "scope": scope,
+            "ok": True,
+            "hit_count": int(result.get("hit_count") or len(hits)),
+            "retrieved_at": retrieved_at,
+        }
+        payload = {
+            "vault_hits": vault_hits,
+            "knowledge_hits": hits,
+            "web_hits": [],
+            "web_error": None,
+            "unresponsive_engines": [],
+            "hint": None,
+            "memory_search": memory_search,
+            "snapshots": snapshots,
+        }
+        digest = hashlib.sha256(repr(payload).encode()).hexdigest()[:16]
+        return {
+            "task_id": task_id,
+            "kind": "search",
+            "ok": True,
+            "query": query,
+            "mode": "memory",
+            "results": payload,
+            "content_hash": digest,
+        }
+    def _read(self, action: HostAction, task_id: str) -> dict[str, Any]:
+        from hyperresearch.pipeline.knowledge import is_stark_ref, snapshot_from_get
+
+        note_id = str(
+            action.args.get("ref") or action.args.get("note_id") or action.args.get("id") or ""
+        ).strip()
+        if self.company == "shoshin" and is_stark_ref(note_id):
+            return {
+                "task_id": task_id,
+                "kind": "evidence_read",
+                "ok": False,
+                "error": "prohibited",
+                "note_id": note_id,
+            }
+        if self.run_tag:
+            for snap in load_snapshots(self.vault, self.run_tag):
+                if str(snap.get("ref") or "") == note_id or str(snap.get("document_id") or "") == note_id:
+                    return {
+                        "task_id": task_id,
+                        "kind": "evidence_read",
+                        "ok": True,
+                        "note_id": note_id,
+                        "body": snap.get("body"),
+                        "content_hash": snap.get("content_hash"),
+                        "namespace": snap.get("namespace"),
+                        "document_id": snap.get("document_id"),
+                        "provenance": list(snap.get("provenance") or []),
+                        "source": "",
+                    }
+        if self.knowledge_reader is not None and note_id:
+            got = self.knowledge_reader.get(note_id)
+            if got.get("error") == "prohibited":
+                return {
+                    "task_id": task_id,
+                    "kind": "evidence_read",
+                    "ok": False,
+                    "error": "prohibited",
+                    "note_id": note_id,
+                }
+            if got.get("ok"):
+                snap = snapshot_from_get(note_id, got)
+                if self.run_tag:
+                    persist_snapshot(self.vault, self.run_tag, snap)
+                return {
+                    "task_id": task_id,
+                    "kind": "evidence_read",
+                    "ok": True,
+                    "note_id": note_id,
+                    "body": snap.get("body"),
+                    "content_hash": snap.get("content_hash"),
+                    "namespace": snap.get("namespace"),
+                    "document_id": snap.get("document_id"),
+                    "provenance": list(snap.get("provenance") or []),
+                    "source": "",
+                }
+        if not _NOTE_ID_RE.fullmatch(note_id):
+            raise IllegalHostAction(f"illegal note id {note_id!r}")
+        rel = action.args.get("path")
+        if rel:
+            path = _safe_path(self.workspace_root, str(rel))
+        else:
+            path = self.vault.notes_dir / f"{note_id}.md"
+            try:
+                path = _safe_path(self.vault.notes_dir, f"{note_id}.md")
+            except IllegalHostAction:
+                raise IllegalHostAction(f"note path escapes workspace: {note_id}")
+        if not path.exists():
+            return {
+                "task_id": task_id,
+                "kind": "evidence_read",
+                "ok": False,
+                "error": "note_not_found",
+                "note_id": note_id,
+            }
+        text = path.read_text(encoding="utf-8-sig")
+        source = ""
+        try:
+            from hyperresearch.core.frontmatter import parse_frontmatter
+            from hyperresearch.core.untrusted import is_untrusted, wrap_body
+
+            meta, body = parse_frontmatter(text)
+            source = str(meta.source or "")
+            note_type = meta.type
+            if is_untrusted(source, note_type):
+                text = wrap_body(body, source)
+        except IllegalHostAction:
+            raise
+        except Exception:
+            pass
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        if self.run_tag:
+            record_evidence(self.vault, self.run_tag, note_id, source, digest, "reused")
+        return {
+            "task_id": task_id,
+            "kind": "evidence_read",
+            "ok": True,
+            "note_id": note_id,
+            "path": str(path),
+            "body": text,
+            "content_hash": digest,
+            "source": source,
+        }
 
     def _search_ok(
         self,
@@ -408,55 +659,6 @@ class HostExecutor:
             "content_hash": hashlib.sha256(body.encode()).hexdigest()[:16],
         }
 
-    def _read(self, action: HostAction, task_id: str) -> dict[str, Any]:
-        note_id = str(action.args.get("note_id") or action.args.get("id") or "").strip()
-        if not _NOTE_ID_RE.fullmatch(note_id):
-            raise IllegalHostAction(f"illegal note id {note_id!r}")
-        rel = action.args.get("path")
-        if rel:
-            path = _safe_path(self.workspace_root, str(rel))
-        else:
-            path = self.vault.notes_dir / f"{note_id}.md"
-            try:
-                path = _safe_path(self.vault.notes_dir, f"{note_id}.md")
-            except IllegalHostAction:
-                raise IllegalHostAction(f"note path escapes workspace: {note_id}")
-        if not path.exists():
-            return {
-                "task_id": task_id,
-                "kind": "evidence_read",
-                "ok": False,
-                "error": "note_not_found",
-                "note_id": note_id,
-            }
-        text = path.read_text(encoding="utf-8-sig")
-        source = ""
-        try:
-            from hyperresearch.core.frontmatter import parse_frontmatter
-            from hyperresearch.core.untrusted import is_untrusted, wrap_body
-
-            meta, body = parse_frontmatter(text)
-            source = str(meta.source or "")
-            note_type = meta.type
-            if is_untrusted(source, note_type):
-                text = wrap_body(body, source)
-        except IllegalHostAction:
-            raise
-        except Exception:
-            pass
-        digest = hashlib.sha256(text.encode()).hexdigest()
-        if self.run_tag:
-            record_evidence(self.vault, self.run_tag, note_id, source, digest, "reused")
-        return {
-            "task_id": task_id,
-            "kind": "evidence_read",
-            "ok": True,
-            "note_id": note_id,
-            "path": str(path),
-            "body": text,
-            "content_hash": digest,
-            "source": source,
-        }
 
 
 def _safe_path(root: Path, raw: str) -> Path:

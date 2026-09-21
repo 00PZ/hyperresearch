@@ -182,21 +182,41 @@ def run_go(
     runtime_name: str = typer.Option("fake", "--runtime", help="fake | model"),
     profile: str = typer.Option("light", "--profile", help="light | full | premier"),
     budget: float | None = typer.Option(None, "--budget"),
+    company: str | None = typer.Option(None, "--company"),
+    knowledge: str | None = typer.Option(None, "--knowledge", help="none | files | gbrain"),
 ) -> None:
     """Start a host-owned research run (invoked as `hpr run \"<query>\"`)."""
     import asyncio
+    import os
+    from pathlib import Path
 
     from hyperresearch.pipeline.orchestrator import execute_run
 
     vault = _vault_or_exit(False)
+    if company == "shoshin":
+        raw = os.environ.get("HYPERRESEARCH_SHOSHIN_VAULT")
+        if raw:
+            from hyperresearch.core.vault import Vault
+
+            root = Path(raw)
+            vault = Vault(root) if (root / ".hyperresearch").is_dir() else Vault.init(root, name="Shoshin")
+    files_root = Path(os.environ["HYPERRESEARCH_KNOWLEDGE_FILES"]) if os.environ.get("HYPERRESEARCH_KNOWLEDGE_FILES") else None
     result = asyncio.run(
-        execute_run(vault, query, _make_runtime(runtime_name), profile=profile, budget_usd=budget)
+        execute_run(
+            vault,
+            query,
+            _make_runtime(runtime_name),
+            profile=profile,
+            budget_usd=budget,
+            company=company,
+            knowledge_backend=knowledge,
+            files_root=files_root,
+        )
     )
     manifest = result["manifest"]
     console.print(f"[green]{result['tag']}[/] status={manifest.get('status')}")
     if manifest.get("status") == "blocked":
         raise typer.Exit(1)
-
 
 @app.command("resume")
 def run_resume(

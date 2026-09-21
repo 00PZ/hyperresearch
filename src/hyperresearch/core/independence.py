@@ -160,3 +160,75 @@ def compute_independence(
         })
     conn.commit()
     return {"scored": scored, "clusters": clusters, "audited": [r["id"] for r in rows]}
+
+
+def cluster_evidence_independence(items: list[dict]) -> dict:
+    """Cluster on document_id and non-empty provenance. Empty provenance is unknown.
+
+    Namespace is not an independence key. Distinct empty-provenance documents
+    must not increment independent_source_count.
+    """
+    nodes: list[dict] = []
+    for raw in items:
+        nid = str(raw.get("id") or raw.get("note_id") or raw.get("document_id") or "")
+        if not nid:
+            continue
+        document_id = str(raw.get("document_id") or nid)
+        prov_raw = raw.get("provenance")
+        provenance: list[str] = []
+        if isinstance(prov_raw, list):
+            provenance = [str(p).strip() for p in prov_raw if str(p).strip()]
+        url = str(raw.get("url") or raw.get("source") or "").strip()
+        if url and url not in provenance:
+            provenance.append(url)
+        nodes.append({"id": nid, "document_id": document_id, "provenance": provenance})
+    if not nodes:
+        return {"independent_source_count": 0, "clusters": [], "audited": []}
+
+    parent = {n["id"]: n["id"] for n in nodes}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    by_doc: dict[str, list[str]] = {}
+    by_prov: dict[str, list[str]] = {}
+    for n in nodes:
+        by_doc.setdefault(n["document_id"], []).append(n["id"])
+        for p in n["provenance"]:
+            by_prov.setdefault(p, []).append(n["id"])
+    for group in by_doc.values():
+        for other in group[1:]:
+            union(group[0], other)
+    for group in by_prov.values():
+        for other in group[1:]:
+            union(group[0], other)
+
+    groups: dict[str, list[dict]] = {}
+    for n in nodes:
+        groups.setdefault(find(n["id"]), []).append(n)
+
+    clusters = []
+    independent = 0
+    for members in groups.values():
+        known = sorted({p for m in members for p in m["provenance"]})
+        if known:
+            independent += 1
+        clusters.append({
+            "members": [m["id"] for m in members],
+            "document_ids": sorted({m["document_id"] for m in members}),
+            "provenance": known,
+            "independent": bool(known),
+        })
+    return {
+        "independent_source_count": independent,
+        "clusters": clusters,
+        "audited": [n["id"] for n in nodes],
+    }

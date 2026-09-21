@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,7 +11,8 @@ from typing import Any, Protocol
 
 ALLOWED_COMPANIES = frozenset({"shoshin"})
 KNOWLEDGE_BACKENDS = frozenset({"none", "files", "gbrain"})
-STARK_PREFIXES = ("companies/stark/", "stark/")
+STARK_MARKER = "companies/stark-industries/"
+SHOSHIN_VAULT_ENV = "HYPERRESEARCH_SHOSHIN_VAULT"
 SHOSHIN_WIKI_PREFIX = "companies/shoshin/knowledge/wiki/"
 SHOSHIN_REPORT_PREFIX = "companies/shoshin/research/reports/"
 SHOSHIN_SKIP_PREFIXES = (
@@ -24,9 +26,37 @@ class KnowledgeReader(Protocol):
     def get(self, ref: str) -> dict[str, Any]: ...
 
 
+class CompanyConfigError(Exception):
+    pass
+
+
+def require_shoshin_vault_root() -> Path:
+    raw = os.environ.get(SHOSHIN_VAULT_ENV)
+    if not raw or not str(raw).strip():
+        raise CompanyConfigError(f"{SHOSHIN_VAULT_ENV} is required for company shoshin")
+    return Path(raw)
+
+
+def configured_knowledge_backend() -> str:
+    named = os.environ.get("HYPERRESEARCH_KNOWLEDGE_BACKEND")
+    if named:
+        return named
+    if os.environ.get("GBRAIN_SHOSHIN_BEARER") or os.environ.get("GBRAIN_SHOSHIN_CONTENT_BEARER"):
+        return "gbrain"
+    if os.environ.get("HYPERRESEARCH_KNOWLEDGE_FILES"):
+        return "files"
+    return "none"
+
+
 def is_stark_ref(ref: str) -> bool:
-    lowered = ref.strip().lower()
-    return lowered.startswith(STARK_PREFIXES) or "/stark/" in lowered
+    text = ref.strip().replace("\\", "/").lower()
+    if STARK_MARKER in text:
+        return True
+    try:
+        resolved = Path(ref).resolve().as_posix().lower()
+    except (OSError, RuntimeError):
+        return False
+    return STARK_MARKER in resolved
 
 
 def _now() -> str:

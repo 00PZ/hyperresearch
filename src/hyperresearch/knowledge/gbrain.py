@@ -65,6 +65,8 @@ class GBrainClient:
         if data.get("error"):
             raise GBrainError(str(data["error"]))
         result = data.get("result")
+        if isinstance(result, dict) and result.get("isError"):
+            raise GBrainError(_error_text(result) or "mcp:isError")
         if isinstance(result, dict) and "structuredContent" in result:
             return result["structuredContent"]
         if isinstance(result, dict) and "content" in result:
@@ -90,7 +92,8 @@ class GBrainClient:
         return self.call("put_page", args)
 
     def put_raw_data(self, key: str, body: bytes | str, **kwargs: Any) -> Any:
-        return self.call("put_raw_data", {"key": key, "body": body, **kwargs})
+        payload = body.decode("utf-8") if isinstance(body, bytes) else body
+        return self.call("put_raw_data", {"key": key, "body": payload, **kwargs})
 
     def search(self, query: str, **kwargs: Any) -> Any:
         return self.call("search", {"query": query, **kwargs})
@@ -99,7 +102,16 @@ class GBrainClient:
         return self.call("list_pages", dict(kwargs))
 
 
-def _pages_from(result: Any) -> list[dict[str, Any]]:
+def _error_text(result: dict[str, Any]) -> str:
+    content = result.get("content")
+    if isinstance(content, list) and content and isinstance(content[0], dict):
+        text = content[0].get("text")
+        if isinstance(text, str) and text:
+            return text
+    return str(result.get("error") or "")
+
+
+def _pages_from(result: Any) -> list[dict[str, Any]] | None:
     if isinstance(result, list):
         return [p for p in result if isinstance(p, dict)]
     if isinstance(result, dict):
@@ -107,7 +119,8 @@ def _pages_from(result: Any) -> list[dict[str, Any]]:
             value = result.get(key)
             if isinstance(value, list):
                 return [p for p in value if isinstance(p, dict)]
-    return []
+        return None
+    return None
 
 
 def _slug_of(page: dict[str, Any]) -> str:
@@ -155,8 +168,11 @@ class GBrainReader:
             result = self.client.search(query, scope=scope) if scope else self.client.search(query)
         except (GBrainError, httpx.HTTPError, ValueError, TypeError) as exc:
             return error_result(str(exc))
+        pages = _pages_from(result)
+        if pages is None:
+            return error_result("unrecognized search payload")
         hits: list[dict[str, Any]] = []
-        for page in _pages_from(result):
+        for page in pages:
             slug = _slug_of(page)
             if not _allowed_slug(slug):
                 continue

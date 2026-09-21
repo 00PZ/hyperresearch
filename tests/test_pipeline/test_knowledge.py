@@ -195,6 +195,19 @@ def test_host_rejects_uncovered_without_memory_search(tmp_vault):
 
 def test_host_accepts_uncovered_with_memory_refs_despite_nonzero_search(tmp_vault):
     init_run(tmp_vault, "gap-refs", company="shoshin")
+    persist_snapshot(
+        tmp_vault,
+        "gap-refs",
+        {
+            "ref": "doc-a",
+            "document_id": "doc-a",
+            "namespace": "shoshin",
+            "type": "wiki",
+            "content_hash": "h",
+            "body": "snap",
+            "provenance": [],
+        },
+    )
     ex = HostExecutor(
         vault=tmp_vault,
         workspace_root=tmp_vault.root,
@@ -559,7 +572,7 @@ def test_stark_evidence_read_prohibited(tmp_vault):
     result = ex.execute(
         HostAction(
             kind="evidence_read",
-            args={"ref": "companies/stark/knowledge/wiki/home"},
+            args={"ref": "companies/stark-industries/knowledge/wiki/home"},
             reason="x",
         ),
         task_id="t",
@@ -607,3 +620,152 @@ def test_grep_pipeline_cli_has_no_paperclip():
     assert "hpr publish" not in joined
     assert "hpr queue" not in joined
     assert "hpr ingest-retry" not in joined
+
+
+def test_files_reader_excludes_stark_industries_employee_secret(tmp_path):
+    root = tmp_path / "kb"
+    secret = root / "companies" / "stark-industries" / "employees" / "jarvis" / "secret.md"
+    secret.parent.mkdir(parents=True)
+    secret.write_text("jarvis-secret-token", encoding="utf-8")
+    (root / "companies" / "shoshin" / "knowledge" / "wiki").mkdir(parents=True)
+    (root / "companies" / "shoshin" / "knowledge" / "wiki" / "ok.md").write_text(
+        "shoshin note", encoding="utf-8"
+    )
+    reader = FilesReader(root=root, namespace="shoshin")
+    found = reader.search("secret")
+    assert found["ok"] is True
+    assert found["hit_count"] == 0
+    assert all("stark-industries" not in h["ref"] for h in found["hits"])
+    got = reader.get("companies/stark-industries/employees/jarvis/secret.md")
+    assert got["ok"] is False
+
+
+def test_fabricated_gap_does_not_open_web(tmp_vault, tmp_path, monkeypatch):
+    _cfg(tmp_vault, tmp_path, monkeypatch)
+    init_run(tmp_vault, "gap-fake", company="shoshin")
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append("searxng")
+        return httpx.Response(200, json={"results": []})
+
+    ex = _ex(
+        tmp_vault,
+        "gap-fake",
+        handler,
+        company="shoshin",
+        knowledge_reader=FakeKnowledgeReader(),
+    )
+    with pytest.raises(IllegalHostAction):
+        ex.execute(
+            HostAction(
+                kind="search",
+                args={
+                    "query": "q",
+                    "mode": "web",
+                    "gap_id": "invented",
+                    "gap": {
+                        "id": "invented",
+                        "question": "q",
+                        "reason": "stale",
+                        "memory_refs": ["never-retrieved"],
+                    },
+                },
+                reason="w",
+            ),
+            task_id="t0",
+        )
+    assert calls == []
+
+
+def test_hpr_run_company_fails_closed_without_vault_env(monkeypatch, tmp_path):
+    from typer.testing import CliRunner
+
+    from hyperresearch.cli import app
+    from hyperresearch.core.vault import Vault
+
+    monkeypatch.delenv("HYPERRESEARCH_SHOSHIN_VAULT", raising=False)
+    Vault.init(tmp_path / "ambient", name="Ambient")
+    monkeypatch.chdir(tmp_path / "ambient")
+    result = CliRunner().invoke(app, ["run", "go", "q", "--company", "shoshin"])
+    assert result.exit_code != 0
+    assert "HYPERRESEARCH_SHOSHIN_VAULT" in result.output
+
+
+def test_gbrain_search_iserror_is_backend_error(tmp_path):
+    from hyperresearch.knowledge.gbrain import GBrainClient, GBrainReader
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "isError": True,
+                    "content": [{"type": "text", "text": "Access denied"}],
+                },
+            },
+        )
+
+    client = GBrainClient("http://gbrain.test/mcp", "tok", transport=httpx.MockTransport(handler))
+    reader = GBrainReader(client)
+    out = reader.search("q")
+    assert out["ok"] is False
+    assert out.get("hit_count") == 0
+    assert out.get("hits") == []
+
+
+def test_gbrain_put_page_iserror_raises():
+    from hyperresearch.knowledge.gbrain import GBrainClient, GBrainError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "isError": True,
+                    "content": [{"type": "text", "text": "Access denied"}],
+                },
+            },
+        )
+
+    client = GBrainClient("http://gbrain.test/mcp", "tok", transport=httpx.MockTransport(handler))
+    with pytest.raises(GBrainError):
+        client.put_page("companies/shoshin/research/reports/x", body="x")
+
+
+def test_gbrain_put_raw_data_iserror_raises():
+    from hyperresearch.knowledge.gbrain import GBrainClient, GBrainError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"isError": True, "content": [{"type": "text", "text": "no"}]},
+            },
+        )
+
+    client = GBrainClient("http://gbrain.test/mcp", "tok", transport=httpx.MockTransport(handler))
+    with pytest.raises(GBrainError):
+        client.put_raw_data("research-abc", b"bytes")
+
+
+def test_gbrain_unrecognized_search_payload_is_not_empty_success():
+    from hyperresearch.knowledge.gbrain import GBrainClient, GBrainReader
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": "Access denied"}},
+        )
+
+    client = GBrainClient("http://gbrain.test/mcp", "tok", transport=httpx.MockTransport(handler))
+    reader = GBrainReader(client)
+    out = reader.search("q")
+    assert out["ok"] is False
+    assert out.get("hits") == []

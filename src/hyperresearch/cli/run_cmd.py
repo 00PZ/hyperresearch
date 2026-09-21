@@ -192,14 +192,18 @@ def run_go(
 
     from hyperresearch.pipeline.orchestrator import execute_run
 
-    vault = _vault_or_exit(False)
     if company == "shoshin":
-        raw = os.environ.get("HYPERRESEARCH_SHOSHIN_VAULT")
-        if raw:
-            from hyperresearch.core.vault import Vault
+        from hyperresearch.core.vault import Vault
+        from hyperresearch.pipeline.knowledge import CompanyConfigError, require_shoshin_vault_root
 
-            root = Path(raw)
-            vault = Vault(root) if (root / ".hyperresearch").is_dir() else Vault.init(root, name="Shoshin")
+        try:
+            root = require_shoshin_vault_root()
+        except CompanyConfigError as exc:
+            console.print(f"[red]Error:[/] {exc}")
+            raise typer.Exit(1) from exc
+        vault = Vault(root) if (root / ".hyperresearch").is_dir() else Vault.init(root, name="Shoshin")
+    else:
+        vault = _vault_or_exit(False)
     files_root = Path(os.environ["HYPERRESEARCH_KNOWLEDGE_FILES"]) if os.environ.get("HYPERRESEARCH_KNOWLEDGE_FILES") else None
     result = asyncio.run(
         execute_run(

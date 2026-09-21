@@ -2,7 +2,7 @@
 
 Implementer contract. Do not re-grill Spec 1 (host pipeline, ModelRuntime, no wiki-write in the fork) or Spec 1.5 (SearXNG JSON search, crawl4ai fetch). Spec 2.1 (company workflow inside `hpr`) is superseded. Do not implement until the operator says `go`.
 
-**Revision 2.2.5:** Worker harvest is in Required Suites (`hr-workflow harvest-gaps`): two Open-gaps lines → two pending items; re-harvest adds none; empty Gaps → zero.
+**Revision 2.2.6:** PR #3 comments: production drain uses configured `execute_run` (FakeRuntime only explicit/test); host gap validation against durable snapshots + recorded memory searches; package validator checks Spec 1 verification bindings; files isolation is `companies/stark-industries/`; missing company vault fails closed; MCP `isError` is a backend error; envelope `put_raw_data` sends evidence bytes; index merge parses Markdown/YAML; ingest-retry takes the company lock; `workflow.json` is atomic.
 
 Tracker: `/opt/data/.scratch/hyperresearch-fork/`
 Glossary: `CONTEXT.md`
@@ -100,14 +100,14 @@ There is **no** HyperResearch → Paperclip edge.
 
 - Pipeline core (`hyperresearch.pipeline`, `hyperresearch.cli` for `hpr`): **no** GBrain client, **no** Paperclip client, **no** queue drain, **no** `hpr publish`, **no** `hpr ingest-retry`. Grep of that tree for Paperclip URLs/ids = fail.
 - `KnowledgeReader` protocol lives in core (tiny). Implementations: `none`, `files`, `gbrain` (gbrain is an **optional extra**, lazy-imported only when configured).
-- Workflow worker: separate console script (this sitting: `hr-workflow`). Same git repo allowed. It may import the GBrain extra and Paperclip. It **invokes** `hpr` as a process (or the same code path as `hpr run`) and reads the package from the run directory. It does not call ModelRuntime.
+- Workflow worker: separate console script (this sitting: `hr-workflow`). Same git repo allowed. It may import the GBrain extra and Paperclip. Production `drain` **invokes the same `execute_run` path as `hpr run`**, passing the configured AgentRuntime and KnowledgeReader from company config (`knowledge_backend` / vault). It does **not** hard-code `FakeRuntime(default=complete)` and does **not** default `knowledge_backend=none` when GBrain/files is configured. `FakeRuntime` is an explicit `--runtime fake` / test / dry-run choice. The worker does not call ModelRuntime itself; it starts `hpr`/`execute_run`. It reads the package from the run directory.
 - `hpr` subcommands must not grow `queue`, `publish`, or `ingest-retry`.
 
 ### Company and vault (engine)
 
 - Allowlist this sitting for `--company`: `shoshin` only. Other values are `blocked_on=config`.
 - Omitting `--company` keeps Spec 1.5 (no KnowledgeReader company memory, no package requirement beyond Spec 1 artifacts).
-- Operational vault for a Shoshin run is a **dedicated root**. Not the Stark/Jarvis vault with a filter.
+- Operational vault for a Shoshin run is a **dedicated root** (`HYPERRESEARCH_SHOSHIN_VAULT`). Not the Stark/Jarvis vault with a filter. If that env (or equivalent config) is **absent**, both `hpr run --company shoshin` and `hr-workflow drain` **fail closed** before starting a company run. They must **not** fall back to `Vault.discover()` / the ambient workspace vault.
 - Manifest stores `company`, vault root, `knowledge_backend` (`none` | `files` | `gbrain`).
 
 ### KnowledgeReader
@@ -133,14 +133,14 @@ Independence clustering uses **`document_id` and non-empty `provenance`**, never
 Backends:
 
 - `none` (**deliberate** config): memory `search` returns empty-success `{ok: true, hit_count: 0, hits: []}` **without consulting a knowledge store**. An accepted `uncovered` gap may open web.
-- `files`: read a configured tree of markdown; no GBrain. A healthy search with zero matching files is `{ok: true, hit_count: 0}`. HTTP/IO/`ok: false` is **not** empty-success and **must not** open SearXNG.
-- `gbrain`: HTTP MCP `search` / `list_pages` / `get_page` with Shoshin-scoped Bearer. Tools for **read** only. Prefixes: `type=wiki` under `companies/shoshin/knowledge/wiki/`, `type=research-report` under `companies/shoshin/research/reports/`. Skip `research-index` and `research-queue`. No `knowledge/raw` crawl. No wiki `put_page`. Adapter maps GBrain `source_id` → snapshot `namespace`, page slug → `document_id`. A healthy search with zero hits is `{ok: true, hit_count: 0}`.
+- `files`: read a configured tree of markdown; no GBrain. Isolation uses the **real** company path `companies/stark-industries/` (and resolved absolute paths under that prefix), **not** a shortened `companies/stark/` substring. A Shoshin `FilesReader` must not `search` or `get` `companies/stark-industries/employees/jarvis/` (or other Stark Industries employee/wiki paths). A healthy search with zero matching files is `{ok: true, hit_count: 0}`. HTTP/IO/`ok: false` is **not** empty-success and **must not** open SearXNG.
+- `gbrain`: HTTP MCP `search` / `list_pages` / `get_page` with Shoshin-scoped Bearer. Tools for **read** only. Prefixes: `type=wiki` under `companies/shoshin/knowledge/wiki/`, `type=research-report` under `companies/shoshin/research/reports/`. Skip `research-index` and `research-queue`. No `knowledge/raw` crawl. No wiki `put_page`. Adapter maps GBrain `source_id` → snapshot `namespace`, page slug → `document_id`. A healthy search with zero hits is `{ok: true, hit_count: 0}`. JSON-RPC **and** MCP tool errors fail closed: HTTP 200 with `result.isError: true` is a **backend error** (`ok: false`), never unwrapped as text/`structuredContent`. Cover **read and write** tools. Malformed or unrecognized search payloads must **not** become `{ok: true, hits: [], hit_count: 0}`.
 
 `gbrain` or `files` **unavailable or misconfigured** (`ok: false`, timeout, missing credentials, missing tree): persist the error. Do **not** convert that error into a successful zero-hit search. Do **not** accept an `uncovered` gap from that failure. Do **not** open SearXNG as a bypass.
 
 Any backend may return a **successful** zero-hit search (`ok: true`, `hit_count: 0`). Only configured `none` may produce that result without consulting a knowledge store. Backend errors must never be converted into successful empty results. A successful zero-hit from `gbrain` or `files` may justify an `uncovered` gap (`memory_search`).
 
-Shoshin gbrain/files readers never return Stark source pages.
+Shoshin gbrain/files readers never return Stark Industries source pages (`companies/stark-industries/…`).
 
 ```mermaid
 flowchart TD
@@ -165,7 +165,8 @@ flowchart TD
   - `memory_search`: `{query, scope, ok: true, hit_count: 0, retrieved_at}` only when `ok` is true and `hit_count` is 0.
   - `stale` / `contradicted`: non-empty `memory_refs`; `memory_search` ignored if present.
   - `uncovered`: non-empty `memory_refs` **or** valid `memory_search`. Invalid `memory_search` ignored when `memory_refs` non-empty.
-- Host rejects unknown ids, reasons outside the enum, `stale`/`contradicted` with empty `memory_refs`, or `uncovered` with empty `memory_refs` and no valid `memory_search`. Empty accepted list = no web.
+- Host `upsert_gap` **shape is not enough**. Before persisting an accepted gap, resolve every `memory_ref` against **durable company+run-scoped host snapshots** for this run (the files the host recorded, not the model’s object). Resolve `memory_search` against a **host-recorded** successful zero-hit search for this run (`query`/`scope`/`ok`/`hit_count`). Fabricated refs, foreign-run refs, or a `memory_search` the host never performed → reject the gap. Do not open web. A model that sends `gap={id:'invented',…,memory_refs:['never-retrieved']}` plus `gap_id='invented'` with no host memory search must not trigger SearXNG.
+- Host also rejects unknown ids, reasons outside the enum, `stale`/`contradicted` with empty `memory_refs`, or `uncovered` with empty `memory_refs` and no valid `memory_search`. Empty accepted list = no web.
 - Sufficiency is the accepted gap record, not `len(hits)`.
 
 ### Company evidence in Spec 1 gates (engine)
@@ -198,7 +199,7 @@ Do **not** put GBrain report slug, index row, or `published_at` in the engine pa
 
 **Canonical payload** (no `package_digest`): UTF-8 JSON, sorted keys, no insignificant whitespace, timestamps frozen once. `package_digest` = hex SHA-256 of that byte string. Reloading the package recomputes the same digest.
 
-A shared validator (core, imported by the worker) reads **only** this package directory: recompute file hashes, recompute digest, check `verification.*` still match those hashes. It must not open orchestrator checkpoints, trip logs, or other mutable workspace files.
+A shared validator (core, imported by the worker) reads **only** this package directory: recompute file hashes, recompute digest, **require** `verification` fields, and check those fields against the frozen report/evidence using **Spec 1 binding rules** (cite-check bind and independence bind over the packaged bytes). Self-consistent file hashes with empty or arbitrary `verification={}` are **invalid**. It must not open orchestrator checkpoints, trip logs, or other mutable workspace files. Rebuild must reuse the **original** verified evidence binding; it must not recompute a new bind over changed evidence.
 
 #### Atomic finalization
 
@@ -240,19 +241,20 @@ Resume:
 - Mapping: `pending` unclaimed; `running` claimed and research not verified or publication not `ok` (includes `package.status=invalid` — recorded error, not a retry loop); `published_pending_ingest` publication `ok` and ingest not `posted`; `published` ingest `posted`; `failed` Spec 1 terminal `blocked_on` only. Publication/ingest/`artifact_error` do **not** set queue `failed`.
 - Named enqueue: CEO/operator HTTP MCP `put_page`. Worker helper may exist; CEO pod does not run `hpr`.
 - Harvest: living `type=wiki`; `Open-gaps` / `Gaps`; `dedup_hash(wiki_slug + gap_text)`; skip empty dashes and hub primer SKUs. Harvest takes the company lock.
-- Claim under lock: `pending` → `running` + new `run_id` then `hpr`. `running` / `published_pending_ingest` with `run_id` → resume dispatch (above). Fail immediately if lock held.
+- Claim under lock: `pending` → `running` + new `run_id` then `hpr`/`execute_run` with the **configured** runtime and KnowledgeReader. `running` / `published_pending_ingest` with `run_id` → resume dispatch (above). Fail immediately if lock held.
 - Drain `--tier full` only. Light `completed` does not publish and does not POST Librarian.
+- `save_workflow` writes a sibling temp file then `os.replace` onto `workflow.json`. An interrupted save must retain the previous valid checkpoint (must not leave `{` / truncated JSON).
 
 #### GBrain publication (worker)
 
 - HTTP MCP: `get_page`, `get_raw_data`, `put_page`, `put_raw_data`. `Accept: application/json, text/event-stream`. Tailscale default `https://brain-jarvis-company.tail8ab21.ts.net/mcp` (unauthenticated POST → 401). Override `GBRAIN_MCP_URL`. Auth: `GBRAIN_SHOSHIN_BEARER` / `GBRAIN_SHOSHIN_CONTENT_BEARER`. Do not print. Do not `kubectl exec`. Do not use Jarvis `default` MCP. `put_page` is unconditional replace (no if-match).
 - **Publication contract:** `publication.status` `idle` | `in_flight` | `partial` | `ok` | `failed`. `publication.reason` only when `failed`: `unconfigured` | `http` | `conflict` | `raw_conflict` | `stale_bindings`. `partial` retryable. `failed`+`http`/`unconfigured` retryable. `failed`+`conflict`/`raw_conflict`/`stale_bindings` = no overwrite.
 - Before any GBrain HTTP: run the **shared package validator** on the handed-off package directory (not engine checkpoints). If invalid: `publication.status=failed`, `reason=stale_bindings` (bindings mismatch) or stop on `artifact_error` (rebuild already failed). No intent.
-- Worker freezes a **publication envelope** **before** the first write: destination slug `companies/shoshin/research/reports/<run_id>`, title from report frontmatter, index row, `published_at`, **frozen published report bytes** (and their sha256), selected `put_raw_data` bodies. Retries use that envelope. The engine does not choose GBrain keys.
+- Worker freezes a **publication envelope** **before** the first write: destination slug `companies/shoshin/research/reports/<run_id>`, title from report frontmatter, index row, `published_at`, **frozen published report bytes** (and their sha256), selected `put_raw_data` **body bytes** (or immutable package paths plus those hashes). Production envelope construction **must** select evidence bodies from the package; omitting `raw_bodies` is not a valid skip of raw publication. Retries use that envelope. `put_raw_data` receives the **evidence bytes**, never the ASCII hex of the hash. The engine does not choose GBrain keys. Distinguish `get_raw_data` **confirmed absence** from **read failure**: only confirmed absence may write; any exception/transport error must not overwrite.
 - Write workflow `publish-intent` from package + envelope. Order: report `put_page` → raw `put_raw_data` → index merge. Skip the report step only if remote **body hash** equals the envelope’s frozen published report hash (not the engine `package_digest` alone). Matching that hash completes the **report step only**.
 - Raw key `research-<hex SHA-256 of body>` (full hash). Same body = skip. Different body = `raw_conflict`, no overwrite. Set `publication.status=failed`.
 - Existing report whose body hash differs from the envelope’s frozen published bytes = `publication.status=failed`, `reason=conflict`, no overwrite. Engine `package_digest` may be stored on the index row as a pointer to the engine package; it is not the skip/conflict key for `put_page`.
-- Index slug `companies/shoshin/research/index`, type `research-index`, YAML `reports:` of `{slug, run_id, company, title, verified_hash, package_digest, published_at}`. Read–merge–write under the worker lock. Never a one-element replace. Memory search excludes it.
+- Index slug `companies/shoshin/research/index`, type `research-index`, YAML `reports:` of `{slug, run_id, company, title, verified_hash, package_digest, published_at}`. `get_page` may return Markdown with YAML `reports:` (or frontmatter). Decode that representation, preserve existing rows and page metadata, serialize a valid page back. A nested Python dict in the test double is not the production shape. Never a one-element replace. Memory search excludes it.
 - Queue bookkeeping `put_page` is read–merge–write of the existing queue document. A stub that drops `query` / `run_id` fails.
 
 #### Paperclip (worker only)
@@ -261,7 +263,7 @@ Resume:
 - `ingest.status`: `idle` | `in_flight` | `posted` | `uncertain` | `failed`. Persist ingest intent **before** POST.
 - Dispatch (`publication.status=ok`):
   - Drain/resume: `idle` → intent then first POST (crash after publish with no intent is `idle`). `in_flight` / `uncertain` → reconcile only (page **all** issues, match `research_slug` in description; empty stays `uncertain`; no `--force`). `failed` → do not POST. `posted` → skip POST; queue merge `ingest_id` / `status=published`.
-  - Explicit ingest-retry command on the **worker**: refuse unless publication `ok`; POST only from `failed` (new intent first); never publish; never call `hpr` as a model run.
+  - Explicit ingest-retry command on the **worker**: acquire the **same company lock** before reading state and hold it through intent, POST/reconciliation, and bookkeeping. Refuse unless publication `ok`; POST only from `failed` (new intent first); never publish; never call `hpr` as a model run. Two overlapping retries, or retry vs drain, must serialize (second process fail-immediately).
 - 2xx with issue id → `posted`. 2xx without id → `uncertain`. Any 5xx / timeout / drop → `uncertain`. 401/403 → `failed`. 409 → reconcile, do not POST.
 - wiki-draft (content Hermes skill `wiki-draft`): `get_page` `research_slug`, distill into seed draft. No content Telegram. No PASS from the worker. Neither `hpr` nor the worker `put_page` living wiki.
 
@@ -284,7 +286,7 @@ Engine omp may land without these types. Worker publish omp must not assume they
 
 ### Isolation
 
-- Shoshin memory search never returns Stark pages. Tests use existing Stark employee/wiki slugs. No Stark `research/` prefix this sitting.
+- Shoshin memory search never returns Stark Industries pages. Tests use the real path `companies/stark-industries/employees/jarvis/` (and wiki under that company), not a shortened `companies/stark/` substring. No Stark `research/` prefix this sitting.
 
 ## Testing Decisions
 
@@ -294,35 +296,40 @@ Split suites so core cannot pass by importing GBrain or Paperclip.
 
 **Engine (default pytest):**
 
-- `--company shoshin` uses the Shoshin vault root; a note planted only in a Stark vault does not appear in FTS.
+- `--company shoshin` uses the Shoshin vault root; a note planted only in a Stark vault does not appear in FTS. Missing `HYPERRESEARCH_SHOSHIN_VAULT` → `hpr run --company shoshin` fails closed (CLI), does not use `Vault.discover()`.
 - Memory `search` does not call SearXNG (mock transport 0).
 - `knowledge=none` / omitted `--company`: `hpr run` imports with GBrain and Paperclip packages absent.
 - `search` mode web without `gap_id` blocks; with a durable gap may call SearXNG (mocked).
 - Gap reasons are the three enum values; emptying hits does not open web.
 - Host rejects `stale`/`contradicted` with empty `memory_refs`.
-- Host accepts `uncovered` with `memory_search: {ok: true, hit_count: 0}`; then web may call SearXNG.
+- Host accepts `uncovered` with `memory_search: {ok: true, hit_count: 0}` **only when that search is host-recorded**; then web may call SearXNG.
 - Host rejects `uncovered` with empty `memory_refs` and no valid `memory_search`.
-- Host accepts `uncovered` with non-empty `memory_refs` even if leftover `memory_search.hit_count != 0`.
+- Host accepts `uncovered` with non-empty **host-recorded** `memory_refs` even if leftover `memory_search.hit_count != 0`.
+- Host **rejects** a gap whose `memory_refs` are not in this run’s durable snapshots, or whose `memory_search` was never performed by the host. Offline FakeKnowledgeReader + invented `gap_id` + fabricated `memory_refs` → no SearXNG.
 - FakeKnowledgeReader timeout (`ok: false`) does not open SearXNG; no `uncovered` gap from that failure.
 - `knowledge=none` empty-success may accept `uncovered` and open web (mocked).
 - Configured `gbrain`/`files` missing credentials or missing tree: no empty-success, no web.
 - Healthy `gbrain` or `files` search returning `{ok: true, hit_count: 0}` may justify `uncovered`; then web may call SearXNG (mocked).
+- MCP HTTP 200 with `isError: true` on search → `ok: false`, not empty-success, no web. Same for write tools (`put_page` / `put_raw_data`) → typed error, not success text. Unrecognized search payload → not `{ok: true, hit_count: 0}`.
+- FilesReader `namespace=shoshin` must not `search` or `get` a file at `companies/stark-industries/employees/jarvis/secret.md`.
 - Full company FakeRuntime run cites at least one company snapshot (empty provenance allowed as **context only**). Independence is satisfied only by **known-distinct provenance** (for example two web hits with different URLs). Empty-provenance snapshots in that run **must not** increment the independent-source count. Cite-check still binds snapshot bytes.
 - Two Shoshin snapshots with **known distinct** provenance count as **two** independent sources (same `namespace=shoshin` must not collapse them).
 - Wiki snapshot + research-report snapshot sharing provenance (same URL) count as **one** lineage.
 - Two Shoshin snapshots with **empty provenance** and different `document_id` must **not** satisfy the independence gate merely because slugs differ.
 - Fixture change after snapshot does not change the bound hash.
 - `verified` is not worker-visible until `verified-package/` exists; interrupt after Spec 1 `verified` persist and before package replace → rebuild without ModelRuntime; rebuilt package passes the shared validator.
-- Rebuilt package whose report bytes no longer match `verification.cite_check_bind` → `package.status=invalid`, `package.reason=artifact_error`, no ModelRuntime, no second `run_id`.
-- Shared validator given only the package directory (no checkpoint files) accepts a golden package and rejects a mutated report file.
+- Rebuilt package whose report bytes no longer match `verification.cite_check_bind` → `package.status=invalid`, `package.reason=artifact_error`, no ModelRuntime, no second `run_id`. Rebuild must not mint a new bind over the changed bytes.
+- Shared validator given only the package directory (no checkpoint files) accepts a golden package **with Spec 1 verification bindings** and rejects: mutated report file; empty `verification={}`; mismatched cite-check / independence bind.
 - Engine package manifest has no GBrain slug, no index row, no `published_at`.
-- Forced `evidence_read` of an existing Stark slug on a Shoshin run is prohibited.
+- Forced `evidence_read` of an existing Stark Industries slug on a Shoshin run is prohibited.
 - Light-tier company run is `completed` and does not require a worker publish.
 - Grep `hpr` CLI + pipeline core: no Paperclip, no `PAPERCLIP_`, no `hpr publish` / `hpr queue` / `hpr ingest-retry`.
 
 **Workflow worker (mocked HTTP, may live under `tests/integrations/`):**
 
 - Two overlapping workers: one holds the lock; the other exits immediately; does not start `hpr run`. GBrain mock `put_page` is unconditional.
+- CLI drain (not an injected `run_hpr` double) passes the configured AgentRuntime and KnowledgeReader into `execute_run`. With GBrain credentials configured, `knowledge_backend` is not silently `none`. `FakeRuntime` only when `--runtime fake` / test.
+- Missing `HYPERRESEARCH_SHOSHIN_VAULT` → `hr-workflow drain` fails closed; does not select the ambient vault.
 - Queue `running` + not `verified` → invoke `hpr` resume for that `run_id`, no second id.
 - Queue `verified` + complete package + publication not `ok` → no ModelRuntime.
 - Light-tier `completed` package: worker does not publish and does not POST Librarian.
@@ -330,10 +337,14 @@ Split suites so core cannot pass by importing GBrain or Paperclip.
 - Drain of `running` + `package.status=invalid` does **not** rebuild and does **not** start `hpr`; explicit rebuild command may rebuild once.
 - Skip report `put_page` only when remote body hash equals the envelope frozen published hash; engine `package_digest` equal is not sufficient if published bytes differ.
 - Conflict: remote body hash ≠ envelope frozen published bytes → `publication.reason=conflict`, remote unchanged.
+- Successful new raw write sends **evidence bytes** to `put_raw_data` (key `research-<sha256 of those bytes>`); retry with the same envelope skips. `get_raw_data` exception is not treated as absence and must not overwrite.
+- Index `get_page` returning Markdown with an existing YAML `reports:` row: merge keeps that row plus the new run (not a one-element replace).
+- Interrupted `save_workflow` retains the previous valid `workflow.json` (not truncated `{`).
 - Crash after publication, ingest `idle` → first POST.
 - Crash after Paperclip 201 before `ingest.id` → reconcile, no second POST.
 - `in_flight` / `uncertain` → reconcile only.
-- `failed` after 4xx → drain does not POST; worker ingest-retry POSTs once.
+- `failed` after 4xx → drain does not POST; worker ingest-retry POSTs once **under the company lock**.
+- Two overlapping ingest-retry processes: one holds the lock; the other fail-immediately; at most one POST. Retry vs drain likewise serializes.
 - Worker ingest-retry when publication not `ok` → non-zero, no publish, no POST, no `hpr` model run.
 - `posted` → queue read–merge–write keeps `query`/`run_id`; report/raw/index not rewritten.
 - Stub queue `put_page` that drops `query` fails.

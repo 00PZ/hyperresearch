@@ -84,7 +84,10 @@ def load_workflow(run_dir: Path) -> dict[str, Any]:
 
 def save_workflow(run_dir: Path, data: dict[str, Any]) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
-    workflow_path(run_dir).write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    dest = workflow_path(run_dir)
+    tmp = dest.with_name(dest.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, dest)
 
 
 def freeze_envelope(
@@ -95,15 +98,21 @@ def freeze_envelope(
     package_digest: str,
     company: str = "shoshin",
     raw_bodies: dict[str, bytes] | None = None,
+    raw_items: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     published = report_bytes
+    raw: list[dict[str, Any]]
+    if raw_items is not None:
+        raw = list(raw_items)
+    else:
+        raw = [{"sha256": _sha(v)} for v in (raw_bodies or {}).values()]
     return {
         "slug": f"{REPORT_PREFIX}{run_id}",
         "title": title,
         "published_at": _now(),
         "published_report_sha256": _sha(published),
         "published_report": published.decode("utf-8") if published[:1] != b"\x00" else "",
-        "raw": {k: _sha(v) for k, v in (raw_bodies or {}).items()},
+        "raw": raw,
         "index_row": {
             "slug": f"{REPORT_PREFIX}{run_id}",
             "run_id": run_id,
@@ -113,6 +122,79 @@ def freeze_envelope(
             "published_at": None,
         },
     }
+
+
+def _evidence_bytes(path: Path) -> bytes:
+    raw = path.read_bytes()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return raw
+    if isinstance(payload, dict) and "body" in payload:
+        return _body_bytes(payload.get("body") or "")
+    return raw
+
+
+def _raw_items_from_package(dest: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for snap in manifest.get("snapshots") or []:
+        rel = str(snap.get("path") or "")
+        spath = dest / rel
+        if not rel or not spath.is_file():
+            continue
+        body = _evidence_bytes(spath)
+        items.append({"sha256": _sha(body), "path": rel})
+    return items
+
+
+def _raw_iter(raw: Any) -> list[dict[str, Any]]:
+    if isinstance(raw, list):
+        return [item if isinstance(item, dict) else {"sha256": str(item)} for item in raw]
+    if isinstance(raw, dict):
+        items: list[dict[str, Any]] = []
+        for key, value in raw.items():
+            if isinstance(value, dict):
+                items.append(value)
+            else:
+                items.append({"sha256": str(key)})
+        return items
+    return []
+
+
+def _parse_index_text(text: str) -> list[dict[str, Any]]:
+    import yaml
+
+    rest = text
+    if text.startswith("---"):
+        parts = text.split("---", 2)
+        if len(parts) >= 3:
+            rest = parts[1] + "\n" + parts[2]
+    try:
+        data = yaml.safe_load(rest)
+    except yaml.YAMLError:
+        return []
+    if isinstance(data, dict) and isinstance(data.get("reports"), list):
+        return [r for r in data["reports"] if isinstance(r, dict)]
+    if isinstance(data, list):
+        return [r for r in data if isinstance(r, dict)]
+    return []
+
+
+def _index_reports(index: Any) -> list[dict[str, Any]]:
+    if isinstance(index, str):
+        return _parse_index_text(index)
+    if not isinstance(index, dict):
+        return []
+    if isinstance(index.get("reports"), list):
+        return [r for r in index["reports"] if isinstance(r, dict)]
+    body = index.get("body")
+    if isinstance(body, str):
+        return _parse_index_text(body)
+    if isinstance(body, dict) and isinstance(body.get("reports"), list):
+        return [r for r in body["reports"] if isinstance(r, dict)]
+    if isinstance(body, list):
+        return [r for r in body if isinstance(r, dict)]
+    return []
 
 
 def _page_body(page: Any) -> bytes:
@@ -161,6 +243,7 @@ def publish_package(
             title=title,
             package_digest=str(manifest.get("package_digest") or ""),
             company=company,
+            raw_items=_raw_items_from_package(dest, manifest),
         )
         pub["envelope"] = envelope
         save_workflow(run_dir, state)
@@ -187,35 +270,48 @@ def publish_package(
         )
     pub["status"] = "partial"
     save_workflow(run_dir, state)
-    for body_hash in (envelope.get("raw") or {}):
+    for item in _raw_iter(envelope.get("raw")):
+        body_hash = str(item.get("sha256") or "")
+        if not body_hash:
+            continue
         key = f"research-{body_hash}"
-        existing = None
         try:
             existing = gbrain.get_raw_data(key)
-        except Exception:
-            existing = None
+        except Exception as exc:
+            pub.update({"status": "failed", "reason": "http", "detail": str(exc)})
+            save_workflow(run_dir, state)
+            return state
         if existing is not None:
             got = _body_bytes(existing if not isinstance(existing, dict) else existing.get("body") or existing)
             if _sha(got) != body_hash:
                 pub.update({"status": "failed", "reason": "raw_conflict"})
                 save_workflow(run_dir, state)
                 return state
+            continue
+        rel = str(item.get("path") or "")
+        if rel:
+            body = _evidence_bytes(dest / rel)
+        elif item.get("body") is not None:
+            body = _body_bytes(item.get("body"))
         else:
-            gbrain.put_raw_data(key, body_hash)
-    index = gbrain.get_page(INDEX_SLUG) or {}
-    reports = []
-    if isinstance(index, dict):
-        body = index.get("body") or index.get("reports") or {}
-        if isinstance(body, dict) and isinstance(body.get("reports"), list):
-            reports = list(body["reports"])
-        elif isinstance(index.get("reports"), list):
-            reports = list(index["reports"])
+            continue
+        gbrain.put_raw_data(key, body)
+    try:
+        index = gbrain.get_page(INDEX_SLUG)
+    except Exception as exc:
+        pub.update({"status": "failed", "reason": "http", "detail": str(exc)})
+        save_workflow(run_dir, state)
+        return state
+    reports = _index_reports(index)
     row = dict(envelope["index_row"])
     row["published_at"] = envelope["published_at"]
     row["verified_hash"] = (manifest.get("verification") or {}).get("verified_hash")
     reports = [r for r in reports if isinstance(r, dict) and r.get("run_id") != run_id]
     reports.append(row)
-    gbrain.put_page(INDEX_SLUG, type="research-index", body={"reports": reports}, reports=reports)
+    import yaml
+
+    index_body = yaml.safe_dump({"reports": reports}, sort_keys=False)
+    gbrain.put_page(INDEX_SLUG, type="research-index", body=index_body)
     pub["status"] = "ok"
     save_workflow(run_dir, state)
     return state
@@ -605,11 +701,20 @@ def _drain_locked(
     return {"ok": True, "results": results}
 
 
-def ingest_retry(paperclip: Any, run_dir: Path, research_slug: str) -> dict[str, Any]:
-    state = load_workflow(run_dir)
-    if (state.get("publication") or {}).get("status") != "ok":
-        raise WorkflowError("ingest-retry requires publication ok")
-    ingest = state.get("ingest") or {}
-    if ingest.get("status") != "failed":
-        raise WorkflowError("ingest-retry only from failed")
-    return dispatch_ingest(paperclip, run_dir, research_slug=research_slug, retry=True)
+def ingest_retry(
+    paperclip: Any,
+    run_dir: Path,
+    research_slug: str,
+    lock_path: Path,
+) -> dict[str, Any]:
+    try:
+        with company_lock(lock_path):
+            state = load_workflow(run_dir)
+            if (state.get("publication") or {}).get("status") != "ok":
+                raise WorkflowError("ingest-retry requires publication ok")
+            ingest = state.get("ingest") or {}
+            if ingest.get("status") != "failed":
+                raise WorkflowError("ingest-retry only from failed")
+            return dispatch_ingest(paperclip, run_dir, research_slug=research_slug, retry=True)
+    except LockHeldError:
+        raise WorkflowError("lock held", code=1) from None

@@ -979,25 +979,18 @@ def _block_if_still_running(
 
 
 def _verification_from_artifacts(vault: Vault, tag: str) -> dict[str, Any]:
-    from datetime import UTC, datetime
+    from hyperresearch.pipeline.package import FROZEN_VERIFICATION, verification_of
 
+    frozen = vault.run_dir(tag) / FROZEN_VERIFICATION
+    if frozen.is_file():
+        data = json.loads(frozen.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data.get("cite_check_bind"):
+            return data
     report = report_path(vault, tag)
-    report_bind = content_hash(report.read_text(encoding="utf-8-sig")) if report.is_file() else ""
-    findings_path = vault.run_dir(tag) / CITE_FINDINGS
-    cite_bind = report_bind
-    if findings_path.is_file():
-        try:
-            findings = json.loads(findings_path.read_text(encoding="utf-8-sig"))
-            if isinstance(findings, dict) and findings.get("report_hash"):
-                cite_bind = str(findings["report_hash"])
-        except json.JSONDecodeError:
-            pass
-    return {
-        "verified_hash": cite_bind or report_bind,
-        "cite_check_bind": cite_bind or report_bind,
-        "independence_bind": _evidence_hash(vault, tag),
-        "verified_at": datetime.now(UTC).isoformat(),
-    }
+    report_bytes = report.read_bytes() if report.is_file() else b""
+    ver = verification_of(report_bytes, load_snapshots(vault, tag))
+    frozen.write_text(json.dumps(ver, indent=2) + "\n", encoding="utf-8")
+    return ver
 
 
 def _write_verified_package(vault: Vault, tag: str, company: str) -> dict[str, Any] | None:
@@ -1041,7 +1034,7 @@ def _resume_package(vault: Vault, tag: str) -> dict[str, Any] | None:
     manifest = load_manifest(vault, tag)
     if not manifest.get("company"):
         return None
-    pkg = manifest.get("package") if isinstance(manifest.get("package"), dict) else {}
+    pkg: dict[str, Any] = manifest["package"] if isinstance(manifest.get("package"), dict) else {}
     if pkg.get("status") == "invalid":
         return {"manifest": manifest, "verify": {"passed": False, "package": pkg}, "tag": tag}
     dest = package_path(vault.run_dir(tag))

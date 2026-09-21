@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from hyperresearch.core.runs import init_run, patch_manifest, set_status
-from hyperresearch.pipeline.package import package_path, write_package
+from hyperresearch.pipeline.package import package_path, verification_of, write_package
 from hyperresearch.workflow import (
     WorkflowError,
     company_lock,
@@ -30,6 +31,7 @@ class FakePageStore:
         self.pages: dict[str, dict[str, Any]] = {}
         self.raw: dict[str, bytes] = {}
         self.put_calls: list[tuple[str, dict[str, Any]]] = []
+        self.raw_puts: list[tuple[str, bytes]] = []
 
     def get_page(self, slug: str) -> dict[str, Any] | None:
         return self.pages.get(slug)
@@ -58,6 +60,7 @@ class FakePageStore:
 
     def put_raw_data(self, key: str, body: Any, **kwargs: Any) -> None:
         raw = body if isinstance(body, bytes) else str(body).encode()
+        self.raw_puts.append((key, raw))
         self.raw[key] = raw
 
 
@@ -97,22 +100,18 @@ class FakePaperclip:
         return R()
 
 
-def _package(vault, tag: str, report: bytes = b"# Title\nhello\n") -> None:
+def _package(vault, tag: str, report: bytes = b"# Title\nhello\n", snapshots: list | None = None) -> None:
     run_dir = vault.run_dir(tag)
     run_dir.mkdir(parents=True, exist_ok=True)
+    snaps = snapshots or []
     write_package(
         run_dir,
         package_path(run_dir),
         company="shoshin",
         run_id=tag,
         report_bytes=report,
-        snapshots=[],
-        verification={
-            "verified_hash": hashlib.sha256(report).hexdigest(),
-            "cite_check_bind": hashlib.sha256(report).hexdigest(),
-            "independence_bind": "e",
-            "verified_at": "t",
-        },
+        snapshots=snaps,
+        verification=verification_of(report, snaps, verified_at="t"),
     )
 
 
@@ -234,15 +233,14 @@ def test_paperclip_500_uncertain_no_extra_post(tmp_vault, monkeypatch):
     assert load_workflow(tmp_vault.run_dir(tag))["ingest"]["status"] == "uncertain"
 
 
-def test_ingest_retry_refuses_unless_publication_ok(tmp_vault, monkeypatch):
+def test_ingest_retry_refuses_unless_publication_ok(tmp_vault, tmp_path, monkeypatch):
     monkeypatch.setenv("PAPERCLIP_API_URL", "http://paperclip.test")
     tag = "ing-deny"
     init_run(tmp_vault, tag, company="shoshin")
     pc = FakePaperclip()
     with pytest.raises(WorkflowError):
-        ingest_retry(pc, tmp_vault.run_dir(tag), "companies/shoshin/research/reports/x")
+        ingest_retry(pc, tmp_vault.run_dir(tag), "companies/shoshin/research/reports/x", tmp_path / "lock")
     assert pc.posts == []
-
 
 def test_light_tier_completed_does_not_post_librarian(tmp_vault, tmp_path, monkeypatch):
     monkeypatch.setenv("GBRAIN_SHOSHIN_BEARER", "tok")
@@ -300,7 +298,7 @@ def test_in_flight_uncertain_reconcile_only(tmp_vault, monkeypatch):
     assert pc.posts == []
 
 
-def test_failed_drain_does_not_post_retry_does(tmp_vault, monkeypatch):
+def test_failed_drain_does_not_post_retry_does(tmp_vault, tmp_path, monkeypatch):
     monkeypatch.setenv("PAPERCLIP_API_URL", "http://paperclip.test")
     monkeypatch.setenv("PAPERCLIP_COMPANY_ID", "co")
     monkeypatch.setenv("PAPERCLIP_LIBRARIAN_AGENT_ID", "lib")
@@ -313,9 +311,8 @@ def test_failed_drain_does_not_post_retry_does(tmp_vault, monkeypatch):
     pc = FakePaperclip()
     dispatch_ingest(pc, tmp_vault.run_dir(tag), research_slug="s")
     assert pc.posts == []
-    ingest_retry(pc, tmp_vault.run_dir(tag), "s")
+    ingest_retry(pc, tmp_vault.run_dir(tag), "s", tmp_path / "lock")
     assert len(pc.posts) == 1
-
 
 def test_missing_bearer_unconfigured_keeps_verified(tmp_vault):
     tag = "pub-unconf"
@@ -464,3 +461,224 @@ def test_harvest_empty_gaps_zero(tmp_path: Path) -> None:
     }
     harvest_gaps(company="shoshin", gbrain=gbrain, lock_path=tmp_path / "co.lock")
     assert _queue_items(gbrain) == []
+
+
+def test_drain_cli_passes_configured_runtime_and_reader(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from hyperresearch.core.vault import Vault
+    from hyperresearch.knowledge.gbrain import GBrainReader
+    from hyperresearch.runtime.fake import FakeRuntime
+    from hyperresearch.workflow import cli as wfcli
+
+    captured: dict[str, Any] = {}
+
+    class Sentinel:
+        name = "model"
+
+    async def fake_execute_run(vault, query, runtime, **kwargs):
+        captured["runtime"] = runtime
+        captured["knowledge_backend"] = kwargs.get("knowledge_backend")
+        captured["knowledge_reader"] = kwargs.get("knowledge_reader")
+        return {"manifest": {"status": "running"}, "verify": {}, "tag": "t"}
+
+    root = tmp_path / "shoshin"
+    Vault.init(root, name="Shoshin")
+    monkeypatch.setenv("HYPERRESEARCH_SHOSHIN_VAULT", str(root))
+    monkeypatch.setenv("GBRAIN_SHOSHIN_BEARER", "tok")
+    monkeypatch.setenv("GBRAIN_MCP_URL", "http://127.0.0.1:9")
+    monkeypatch.delenv("HYPERRESEARCH_KNOWLEDGE_BACKEND", raising=False)
+    monkeypatch.setattr(wfcli, "_make_runtime", lambda name: Sentinel() if name != "fake" else FakeRuntime())
+    monkeypatch.setattr("hyperresearch.pipeline.orchestrator.execute_run", fake_execute_run)
+
+    gbrain = FakePageStore()
+    gbrain.pages["companies/shoshin/research/queue/q1"] = {
+        "slug": "companies/shoshin/research/queue/q1",
+        "status": "pending",
+        "query": "q",
+        "body": {"status": "pending", "query": "q"},
+    }
+    monkeypatch.setattr(wfcli, "_gbrain", lambda: gbrain)
+    result = CliRunner().invoke(wfcli.app, ["drain", "--company", "shoshin"])
+    assert result.exit_code == 0, result.output
+    assert captured["knowledge_backend"] == "gbrain"
+    assert captured["runtime"].name == "model"
+    assert not isinstance(captured["runtime"], FakeRuntime)
+    assert isinstance(captured["knowledge_reader"], GBrainReader)
+
+
+def test_hr_workflow_drain_fails_closed_without_vault_env(monkeypatch, tmp_path):
+    from typer.testing import CliRunner
+
+    from hyperresearch.core.vault import Vault
+    from hyperresearch.workflow.cli import app
+
+    monkeypatch.delenv("HYPERRESEARCH_SHOSHIN_VAULT", raising=False)
+    Vault.init(tmp_path / "ambient", name="Ambient")
+    monkeypatch.chdir(tmp_path / "ambient")
+    result = CliRunner().invoke(app, ["drain", "--company", "shoshin"])
+    assert result.exit_code != 0
+    assert "HYPERRESEARCH_SHOSHIN_VAULT" in result.output
+
+
+def test_successful_new_raw_write_and_retry_skip(tmp_vault, monkeypatch):
+    monkeypatch.setenv("GBRAIN_SHOSHIN_BEARER", "tok")
+    tag = "raw-ok"
+    init_run(tmp_vault, tag, company="shoshin")
+    evidence = b"EVIDENCE-BODY"
+    _package(
+        tmp_vault,
+        tag,
+        b"# Title\nhello\n",
+        snapshots=[
+            {
+                "ref": "d1",
+                "document_id": "d1",
+                "namespace": "shoshin",
+                "type": "wiki",
+                "body": evidence.decode(),
+                "provenance": [],
+            }
+        ],
+    )
+    gbrain = FakePageStore()
+    first = publish_package(gbrain, tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
+    assert first["publication"]["status"] == "ok"
+    key = f"research-{hashlib.sha256(evidence).hexdigest()}"
+    assert gbrain.raw[key] == evidence
+    assert gbrain.raw_puts == [(key, evidence)]
+    second = publish_package(gbrain, tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
+    assert second["publication"]["status"] == "ok"
+    assert gbrain.raw_puts == [(key, evidence)]
+
+
+def test_get_raw_data_exception_does_not_overwrite(tmp_vault, monkeypatch):
+    monkeypatch.setenv("GBRAIN_SHOSHIN_BEARER", "tok")
+    tag = "raw-exc"
+    init_run(tmp_vault, tag, company="shoshin")
+    evidence = b"EVIDENCE-BODY"
+    _package(
+        tmp_vault,
+        tag,
+        b"# Title\nhello\n",
+        snapshots=[
+            {
+                "ref": "d1",
+                "document_id": "d1",
+                "body": evidence.decode(),
+            }
+        ],
+    )
+
+    class Boom(FakePageStore):
+        def get_raw_data(self, key: str) -> bytes | None:
+            raise RuntimeError("transport")
+
+    gbrain = Boom()
+    out = publish_package(gbrain, tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
+    assert out["publication"]["reason"] == "http"
+    assert gbrain.raw_puts == []
+
+
+def test_index_merge_keeps_existing_yaml_row(tmp_vault, monkeypatch):
+    monkeypatch.setenv("GBRAIN_SHOSHIN_BEARER", "tok")
+    tag = "idx-md"
+    init_run(tmp_vault, tag, company="shoshin")
+    _package(tmp_vault, tag, b"# Title\nhello\n")
+    gbrain = FakePageStore()
+    gbrain.pages["companies/shoshin/research/index"] = {
+        "body": "---\nreports:\n  - slug: old\n    run_id: old-run\n    title: Old\n"
+    }
+    publish_package(gbrain, tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
+    puts = [c for c in gbrain.put_calls if c[0] == "companies/shoshin/research/index"]
+    assert puts
+    body = puts[-1][1]["body"]
+    assert isinstance(body, str)
+    assert "old-run" in body
+    assert tag in body
+
+
+def test_overlapping_ingest_retries_second_fails_immediately(tmp_vault, tmp_path, monkeypatch):
+    monkeypatch.setenv("PAPERCLIP_API_URL", "http://paperclip.test")
+    monkeypatch.setenv("PAPERCLIP_COMPANY_ID", "co")
+    monkeypatch.setenv("PAPERCLIP_LIBRARIAN_AGENT_ID", "lib")
+    tag = "ing-lock"
+    init_run(tmp_vault, tag, company="shoshin")
+    st = load_workflow(tmp_vault.run_dir(tag))
+    st["publication"] = {"status": "ok"}
+    st["ingest"] = {"status": "failed"}
+    save_workflow(tmp_vault.run_dir(tag), st)
+    lock = tmp_path / "co.lock"
+    pc = FakePaperclip()
+    with company_lock(lock), pytest.raises(WorkflowError, match="lock held"):
+        ingest_retry(pc, tmp_vault.run_dir(tag), "s", lock)
+    assert pc.posts == []
+
+
+def test_ingest_retry_vs_drain_serializes(tmp_vault, tmp_path, monkeypatch):
+    monkeypatch.setenv("PAPERCLIP_API_URL", "http://paperclip.test")
+    monkeypatch.setenv("PAPERCLIP_COMPANY_ID", "co")
+    monkeypatch.setenv("PAPERCLIP_LIBRARIAN_AGENT_ID", "lib")
+    monkeypatch.setenv("GBRAIN_SHOSHIN_BEARER", "tok")
+    tag = "ing-drain"
+    init_run(tmp_vault, tag, company="shoshin")
+    set_status(tmp_vault, tag, "verified")
+    _package(tmp_vault, tag)
+    st = load_workflow(tmp_vault.run_dir(tag))
+    st["publication"] = {"status": "ok"}
+    st["ingest"] = {"status": "failed"}
+    save_workflow(tmp_vault.run_dir(tag), st)
+    lock = tmp_path / "co.lock"
+    pc = FakePaperclip()
+    slug = "companies/shoshin/research/queue/q1"
+    page = {
+        "slug": slug,
+        "status": "running",
+        "run_id": tag,
+        "query": "q",
+        "body": {"status": "running", "run_id": tag, "query": "q"},
+    }
+    with company_lock(lock):
+        with pytest.raises(WorkflowError, match="lock held"):
+            ingest_retry(pc, tmp_vault.run_dir(tag), "s", lock)
+        with pytest.raises(WorkflowError, match="lock held"):
+            drain(
+                company="shoshin",
+                tier="full",
+                vault=tmp_vault,
+                gbrain=FakePageStore(),
+                paperclip=pc,
+                run_hpr=lambda *a, **k: (_ for _ in ()).throw(AssertionError("no hpr")),
+                lock_path=lock,
+                queue_pages=[page],
+            )
+    assert pc.posts == []
+
+
+def test_interrupted_save_workflow_retains_previous(tmp_path):
+    run_dir = tmp_path / "run"
+    save_workflow(run_dir, {"publication": {"status": "ok"}, "n": 1})
+    dest = run_dir / "workflow.json"
+    assert json.loads(dest.read_text(encoding="utf-8"))["n"] == 1
+
+    def boom_replace(src: str, dst: str) -> None:
+        raise OSError("interrupt")
+
+    import os
+
+    real = os.replace
+
+    def guarded(src: str, dst: str) -> None:
+        if str(dst).endswith("workflow.json"):
+            boom_replace(src, dst)
+        else:
+            real(src, dst)
+
+    try:
+        os.replace = guarded  # type: ignore[method-assign]
+        with pytest.raises(OSError):
+            save_workflow(run_dir, {"publication": {"status": "ok"}, "n": 2})
+    finally:
+        os.replace = real  # type: ignore[method-assign]
+    assert json.loads(dest.read_text(encoding="utf-8"))["n"] == 1
+    assert dest.read_text(encoding="utf-8")[0] != "{" or json.loads(dest.read_text(encoding="utf-8"))["n"] == 1

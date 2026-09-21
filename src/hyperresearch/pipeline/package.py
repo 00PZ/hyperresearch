@@ -14,6 +14,8 @@ from typing import Any
 SCHEMA = "hyperresearch.package.v1"
 PACKAGE_DIR = "verified-package"
 FORBIDDEN_ENGINE_KEYS = frozenset({"slug", "index", "published_at", "gbrain_slug"})
+REQUIRED_VERIFICATION = ("verified_hash", "cite_check_bind", "independence_bind", "verified_at")
+FROZEN_VERIFICATION = "package-verification.json"
 
 
 class PackageError(Exception):
@@ -42,6 +44,40 @@ def package_digest_of(manifest: dict[str, Any]) -> str:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def report_bind(report_bytes: bytes) -> str:
+    from hyperresearch.pipeline.patch import content_hash
+
+    try:
+        return content_hash(report_bytes.decode("utf-8-sig"))
+    except UnicodeDecodeError:
+        return _sha256_bytes(report_bytes)
+
+
+def snapshots_bind(snapshots: list[dict[str, Any]]) -> str:
+    from hyperresearch.pipeline.patch import content_hash
+
+    lines = [
+        f"{snap.get('document_id') or snap.get('ref') or ''}:{content_hash(str(snap.get('body') or ''))}"
+        for snap in snapshots
+    ]
+    return content_hash("\n".join(sorted(lines)))
+
+
+def verification_of(
+    report_bytes: bytes,
+    snapshots: list[dict[str, Any]],
+    *,
+    verified_at: str | None = None,
+) -> dict[str, Any]:
+    cite = report_bind(report_bytes)
+    return {
+        "verified_hash": cite,
+        "cite_check_bind": cite,
+        "independence_bind": snapshots_bind(snapshots),
+        "verified_at": verified_at or _now(),
+    }
 
 
 def package_path(run_dir: Path) -> Path:
@@ -83,6 +119,26 @@ def validate_package(package_dir: Path) -> dict[str, Any]:
     expected = package_digest_of(manifest)
     if manifest.get("package_digest") != expected:
         raise PackageError("stale_bindings", "package_digest mismatch")
+    ver = manifest.get("verification")
+    if not isinstance(ver, dict):
+        raise PackageError("stale_bindings", "verification missing")
+    for key in REQUIRED_VERIFICATION:
+        if not ver.get(key):
+            raise PackageError("stale_bindings", f"verification.{key} missing")
+    report_bytes = report_path.read_bytes()
+    cite = str(ver["cite_check_bind"])
+    if cite != _sha256_bytes(report_bytes) and cite != report_bind(report_bytes):
+        raise PackageError("stale_bindings", "cite_check_bind mismatch")
+    loaded: list[dict[str, Any]] = []
+    for snap in manifest.get("snapshots") or []:
+        spath = package_dir / str(snap.get("path") or "")
+        try:
+            data = json.loads(spath.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise PackageError("artifact_error", "snapshot is not JSON") from exc
+        loaded.append(data if isinstance(data, dict) else {})
+    if str(ver["independence_bind"]) != snapshots_bind(loaded):
+        raise PackageError("stale_bindings", "independence_bind mismatch")
     return manifest
 
 
@@ -169,12 +225,11 @@ def rebuild_package(
         raise PackageError("artifact_error", "report artifact missing")
     report_bytes = report_path.read_bytes()
     cite = str(verification.get("cite_check_bind") or "")
-    if cite:
-        from hyperresearch.pipeline.patch import content_hash
-
-        text_hash = content_hash(report_path.read_text(encoding="utf-8-sig"))
-        if cite != _sha256_bytes(report_bytes) and cite != text_hash:
-            raise PackageError("artifact_error", "report bytes no longer match cite_check_bind")
+    if not cite or (cite != _sha256_bytes(report_bytes) and cite != report_bind(report_bytes)):
+        raise PackageError("artifact_error", "report bytes no longer match cite_check_bind")
+    indep = str(verification.get("independence_bind") or "")
+    if not indep or indep != snapshots_bind(snapshots):
+        raise PackageError("artifact_error", "evidence no longer matches independence_bind")
     return write_package(
         run_dir,
         package_path(run_dir),

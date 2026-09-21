@@ -12,6 +12,7 @@ from hyperresearch.pipeline.package import (
     PackageError,
     package_path,
     validate_package,
+    verification_of,
     write_package,
 )
 from hyperresearch.runtime import FakeRuntime
@@ -44,12 +45,17 @@ def _pkg(tmp_vault, tag: str = "pkg-1") -> Path:
                 "provenance": ["https://a.example"],
             }
         ],
-        verification={
-            "verified_hash": "h",
-            "cite_check_bind": "h",
-            "independence_bind": "e",
-            "verified_at": "t",
-        },
+        verification=verification_of(
+            b"# report\n",
+            [
+                {
+                    "ref": "d1",
+                    "document_id": "d1",
+                    "body": "snap",
+                }
+            ],
+            verified_at="t",
+        ),
     )
     return dest
 
@@ -128,3 +134,72 @@ def test_artifact_error(tmp_vault):
     assert pkg.get("status") == "invalid"
     assert pkg.get("reason") == "artifact_error"
     assert second["manifest"]["vault_tag"] == tag
+
+
+def test_validator_rejects_empty_verification(tmp_vault):
+    run_dir = tmp_vault.run_dir("pkg-empty")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    dest = package_path(run_dir)
+    write_package(
+        run_dir,
+        dest,
+        company="shoshin",
+        run_id="pkg-empty",
+        report_bytes=b"UNVERIFIED",
+        snapshots=[],
+        verification={},
+    )
+    try:
+        validate_package(dest)
+        raise AssertionError("empty verification must fail")
+    except PackageError as exc:
+        assert exc.reason == "stale_bindings"
+
+
+def test_validator_rejects_mismatched_bindings(tmp_vault):
+    run_dir = tmp_vault.run_dir("pkg-mis")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    dest = package_path(run_dir)
+    write_package(
+        run_dir,
+        dest,
+        company="shoshin",
+        run_id="pkg-mis",
+        report_bytes=b"# report\n",
+        snapshots=[{"document_id": "d1", "body": "snap"}],
+        verification={
+            "verified_hash": "nope",
+            "cite_check_bind": "nope",
+            "independence_bind": "nope",
+            "verified_at": "t",
+        },
+    )
+    try:
+        validate_package(dest)
+        raise AssertionError("mismatched binds must fail")
+    except PackageError as exc:
+        assert exc.reason == "stale_bindings"
+
+
+def test_rebuild_reuses_original_bind_not_new_over_changed_evidence(tmp_vault):
+    from hyperresearch.pipeline.package import rebuild_package
+
+    dest = _pkg(tmp_vault, "pkg-rebind")
+    original = validate_package(dest)
+    cite = original["verification"]["cite_check_bind"]
+    run_dir = tmp_vault.run_dir("pkg-rebind")
+    report = run_dir / "report-artifact.md"
+    report.write_bytes(b"# changed evidence\n")
+    try:
+        rebuild_package(
+            run_dir,
+            company="shoshin",
+            run_id="pkg-rebind",
+            report_path=report,
+            snapshots=[{"document_id": "d1", "body": "snap"}],
+            verification=dict(original["verification"]),
+        )
+        raise AssertionError("rebuild must not mint a new bind")
+    except PackageError as exc:
+        assert exc.reason == "artifact_error"
+    assert original["verification"]["cite_check_bind"] == cite

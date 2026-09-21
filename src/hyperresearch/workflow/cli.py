@@ -9,6 +9,12 @@ from typing import Any
 import httpx
 import typer
 
+from hyperresearch.pipeline.knowledge import (
+    CompanyConfigError,
+    configured_knowledge_backend,
+    load_reader,
+    require_shoshin_vault_root,
+)
 from hyperresearch.workflow import (
     WorkflowError,
     drain,
@@ -23,11 +29,8 @@ app = typer.Typer(no_args_is_help=True)
 def _vault() -> Any:
     from hyperresearch.core.vault import Vault
 
-    company = os.environ.get("HYPERRESEARCH_SHOSHIN_VAULT")
-    if company:
-        root = Path(company)
-        return Vault(root) if (root / ".hyperresearch").is_dir() else Vault.init(root, name="Shoshin")
-    return Vault.discover()
+    root = require_shoshin_vault_root()
+    return Vault(root) if (root / ".hyperresearch").is_dir() else Vault.init(root, name="Shoshin")
 
 
 def _gbrain() -> Any:
@@ -40,29 +43,56 @@ def _gbrain() -> Any:
     return GBrainClient(url, bearer)
 
 
+def _make_runtime(name: str) -> Any:
+    if name == "fake":
+        from hyperresearch.runtime.fake import FakeRuntime
+
+        return FakeRuntime(default={"kind": "complete", "args": {}, "reason": "worker"})
+    from hyperresearch.runtime.model import ModelRuntime
+
+    return ModelRuntime.from_env()
+
+
 @app.command("drain")
 def drain_cmd(
     company: str = typer.Option(..., "--company"),
     tier: str = typer.Option("full", "--tier"),
+    runtime_name: str = typer.Option("model", "--runtime"),
 ) -> None:
     import asyncio
 
     from hyperresearch.pipeline.orchestrator import execute_run
-    from hyperresearch.runtime.fake import FakeRuntime
 
-    vault = _vault()
+    try:
+        vault = _vault()
+    except CompanyConfigError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
     lock_path = vault.root / ".hr-workflow.lock"
+    runtime = _make_runtime(runtime_name)
+    backend = configured_knowledge_backend()
+    files_root = (
+        Path(os.environ["HYPERRESEARCH_KNOWLEDGE_FILES"])
+        if os.environ.get("HYPERRESEARCH_KNOWLEDGE_FILES")
+        else None
+    )
+    reader = None
+    if backend != "none":
+        reader = load_reader(backend, files_root=files_root)
 
     def run_hpr(query: str, run_id: str, resume: bool = False) -> Any:
         return asyncio.run(
             execute_run(
                 vault,
                 query,
-                FakeRuntime(default={"kind": "complete", "args": {}, "reason": "worker"}),
+                runtime,
                 profile="full" if tier == "full" else "light",
                 tag=run_id,
                 resume=resume,
                 company=company,
+                knowledge_backend=backend,
+                knowledge_reader=reader,
+                files_root=files_root,
             )
         )
 
@@ -80,6 +110,7 @@ def drain_cmd(
             run_hpr=run_hpr,
             lock_path=lock_path,
             queue_pages=queue,
+            runtime=runtime,
         )
     except WorkflowError as exc:
         typer.echo(str(exc), err=True)
@@ -88,7 +119,11 @@ def drain_cmd(
 
 @app.command("harvest-gaps")
 def harvest_gaps_cmd(company: str = typer.Option(..., "--company")) -> None:
-    vault = _vault()
+    try:
+        vault = _vault()
+    except CompanyConfigError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
     lock_path = vault.root / ".hr-workflow.lock"
     try:
         harvest_gaps(company=company, gbrain=_gbrain(), lock_path=lock_path)
@@ -102,12 +137,18 @@ def ingest_retry_cmd(
     run_id: str = typer.Argument(...),
     company: str = typer.Option("shoshin", "--company"),
 ) -> None:
-    vault = _vault()
+    try:
+        vault = _vault()
+    except CompanyConfigError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+    lock_path = vault.root / ".hr-workflow.lock"
     try:
         ingest_retry(
             httpx.Client(timeout=30.0),
             vault.run_dir(run_id),
             f"companies/shoshin/research/reports/{run_id}",
+            lock_path,
         )
     except WorkflowError as exc:
         typer.echo(str(exc), err=True)

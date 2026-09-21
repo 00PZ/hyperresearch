@@ -277,15 +277,22 @@ class HostExecutor:
                 "content_hash": digest,
             }
         if self.company:
+            mode = str(action.args.get("mode") or "memory").strip() or "memory"
+            if mode != "web":
+                result = self._memory_search(action, task_id, query, limit)
+                gap_raw = action.args.get("gap")
+                if isinstance(gap_raw, dict):
+                    from hyperresearch.pipeline.gaps import upsert_gap
+
+                    if not self.run_tag or upsert_gap(self.vault.run_dir(self.run_tag), gap_raw) is None:
+                        raise IllegalHostAction("invalid gap")
+                return result
             gap_raw = action.args.get("gap")
             if isinstance(gap_raw, dict):
                 from hyperresearch.pipeline.gaps import upsert_gap
 
                 if not self.run_tag or upsert_gap(self.vault.run_dir(self.run_tag), gap_raw) is None:
                     raise IllegalHostAction("invalid gap")
-            mode = str(action.args.get("mode") or "memory").strip() or "memory"
-            if mode != "web":
-                return self._memory_search(action, task_id, query, limit)
             from hyperresearch.pipeline.gaps import accepted_gap
 
             gap_id = str(action.args.get("gap_id") or "")
@@ -419,6 +426,10 @@ class HostExecutor:
             "hit_count": int(result.get("hit_count") or len(hits)),
             "retrieved_at": retrieved_at,
         }
+        if self.run_tag:
+            from hyperresearch.pipeline.gaps import record_memory_search
+
+            record_memory_search(self.vault.run_dir(self.run_tag), memory_search)
         payload = {
             "vault_hits": vault_hits,
             "knowledge_hits": hits,
@@ -439,6 +450,7 @@ class HostExecutor:
             "results": payload,
             "content_hash": digest,
         }
+
     def _read(self, action: HostAction, task_id: str) -> dict[str, Any]:
         from hyperresearch.pipeline.knowledge import is_stark_ref, snapshot_from_get
 

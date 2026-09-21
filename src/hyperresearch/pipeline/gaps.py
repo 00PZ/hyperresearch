@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 GAPS_NAME = "gaps.json"
+MEMORY_SEARCHES_NAME = "memory-searches.json"
 REASONS = frozenset({"stale", "uncovered", "contradicted"})
 
 
@@ -36,6 +37,53 @@ def save_gaps(run_dir: Path, gaps: list[dict[str, Any]]) -> None:
     )
 
 
+def memory_searches_path(run_dir: Path) -> Path:
+    return run_dir / MEMORY_SEARCHES_NAME
+
+
+def load_memory_searches(run_dir: Path) -> list[dict[str, Any]]:
+    path = memory_searches_path(run_dir)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError:
+        return []
+    if isinstance(data, list):
+        return [r for r in data if isinstance(r, dict)]
+    if isinstance(data, dict) and isinstance(data.get("searches"), list):
+        return [r for r in data["searches"] if isinstance(r, dict)]
+    return []
+
+
+def record_memory_search(run_dir: Path, record: dict[str, Any]) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    rows = load_memory_searches(run_dir)
+    rows.append(record)
+    memory_searches_path(run_dir).write_text(
+        json.dumps({"searches": rows}, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def host_snapshot_refs(run_dir: Path) -> set[str]:
+    refs: set[str] = set()
+    sdir = run_dir / "snapshots"
+    if not sdir.is_dir():
+        return refs
+    for path in sdir.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        for key in ("ref", "document_id"):
+            value = data.get(key)
+            if value:
+                refs.add(str(value))
+    return refs
+
+
 def valid_memory_search(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
@@ -57,6 +105,38 @@ def valid_memory_search(value: Any) -> dict[str, Any] | None:
         "hit_count": 0,
         "retrieved_at": value.get("retrieved_at"),
     }
+
+
+def host_recorded_zero_hit(run_dir: Path, memory_search: dict[str, Any]) -> bool:
+    rec = valid_memory_search(memory_search)
+    if rec is None:
+        return False
+    for row in load_memory_searches(run_dir):
+        if row.get("ok") is not True:
+            continue
+        try:
+            hit_count = int(row.get("hit_count") or 0)
+        except (TypeError, ValueError):
+            continue
+        if hit_count != 0:
+            continue
+        if str(row.get("query") or "").strip() != rec["query"]:
+            continue
+        if row.get("scope") != rec["scope"]:
+            continue
+        return True
+    return False
+
+
+def _host_backed(run_dir: Path, gap: dict[str, Any]) -> bool:
+    refs = [str(r) for r in (gap.get("memory_refs") or []) if r]
+    if refs:
+        known = host_snapshot_refs(run_dir)
+        return all(ref in known for ref in refs)
+    search = gap.get("memory_search")
+    if isinstance(search, dict):
+        return host_recorded_zero_hit(run_dir, search)
+    return False
 
 
 def normalize_gap(raw: dict[str, Any]) -> dict[str, Any] | None:
@@ -99,7 +179,7 @@ def normalize_gap(raw: dict[str, Any]) -> dict[str, Any] | None:
 
 def upsert_gap(run_dir: Path, raw: dict[str, Any]) -> dict[str, Any] | None:
     gap = normalize_gap(raw)
-    if gap is None:
+    if gap is None or not _host_backed(run_dir, gap):
         return None
     gaps = load_gaps(run_dir)
     by_id = {str(g.get("id")): g for g in gaps}

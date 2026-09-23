@@ -47,7 +47,8 @@ parallel = ["mcp>=1.8,<2"]
 exa = ["exa-py>=2.0.0"]
 tavily = ["tavily-python>=0.3"]
 watch = ["watchdog>=4.0"]
-all = ["hyperresearch[crawl4ai,mcp,parallel,exa,tavily,watch]"]
+gbrain = []
+all = ["hyperresearch[crawl4ai,mcp,parallel,exa,tavily,watch,gbrain]"]
 dev = [
     "pytest>=7.4",
     "pytest-cov>=4.1",
@@ -62,6 +63,7 @@ dev = [
 [project.scripts]
 hyperresearch = "hyperresearch.cli:app"
 hpr = "hyperresearch.cli:app"
+hr-workflow = "hyperresearch.workflow.cli:app"
 
 [project.urls]
 Homepage = "https://github.com/jordan-gibbs/hyperresearch"
@@ -107,4 +109,5 @@ testpaths = ["tests"]
 addopts = "-ra -q --strict-markers"
 markers = [
     "searxng_live: live SearXNG JSON probe; needs HYPERRESEARCH_LIVE_SEARXNG=1 and SEARXNG_URL",
+    "gbrain_live: live GBrain MCP probe; needs HYPERRESEARCH_LIVE_GBRAIN=1, URL, and Bearer",
 ]

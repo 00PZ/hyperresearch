@@ -10,7 +10,12 @@ from typing import Any
 import pytest
 
 from hyperresearch.core.runs import init_run, patch_manifest, set_status
-from hyperresearch.pipeline.package import package_path, verification_of, write_package
+from hyperresearch.pipeline.package import (
+    package_path,
+    validate_package,
+    verification_of,
+    write_package,
+)
 from hyperresearch.workflow import (
     WorkflowError,
     company_lock,
@@ -587,7 +592,10 @@ def test_index_merge_keeps_existing_yaml_row(tmp_vault, monkeypatch):
     _package(tmp_vault, tag, b"# Title\nhello\n")
     gbrain = FakePageStore()
     gbrain.pages["companies/shoshin/research/index"] = {
-        "body": "---\nreports:\n  - slug: old\n    run_id: old-run\n    title: Old\n"
+        "body": (
+            "---\nreports:\n  - run_id: old-run\n    slug: old\n"
+            "---\n# Research catalog\nPublished reports for Shoshin.\n"
+        )
     }
     publish_package(gbrain, tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
     puts = [c for c in gbrain.put_calls if c[0] == "companies/shoshin/research/index"]
@@ -682,3 +690,106 @@ def test_interrupted_save_workflow_retains_previous(tmp_path):
         os.replace = real  # type: ignore[method-assign]
     assert json.loads(dest.read_text(encoding="utf-8"))["n"] == 1
     assert dest.read_text(encoding="utf-8")[0] != "{" or json.loads(dest.read_text(encoding="utf-8"))["n"] == 1
+
+
+def test_drain_runtime_recovers_missing_package(tmp_vault, tmp_path):
+    import asyncio
+    import shutil
+
+    from hyperresearch.pipeline.orchestrator import execute_run
+    from hyperresearch.runtime import FakeRuntime
+    from tests.test_pipeline.test_full import _rt, plant_src, run
+
+    tag = "drain-rec"
+    plant_src(tmp_vault, tag)
+    result = run(
+        execute_run(
+            tmp_vault,
+            "q",
+            _rt(),
+            profile="full",
+            tag=tag,
+            company="shoshin",
+        )
+    )
+    assert result["manifest"]["status"] == "verified"
+    dest = package_path(tmp_vault.run_dir(tag))
+    shutil.rmtree(dest)
+
+    class BoomRuntime(FakeRuntime):
+        async def run(self, task, context):  # type: ignore[no-untyped-def]
+            raise AssertionError("ModelRuntime must not run")
+
+    def run_hpr(query: str, run_id: str, resume: bool = False) -> Any:
+        return asyncio.run(
+            execute_run(
+                tmp_vault,
+                query,
+                BoomRuntime(),
+                profile="full",
+                tag=run_id,
+                resume=True,
+                company="shoshin",
+            )
+        )
+
+    slug = "companies/shoshin/research/queue/q-rec"
+    page = {
+        "slug": slug,
+        "status": "running",
+        "run_id": tag,
+        "query": "q",
+        "body": {"status": "running", "run_id": tag, "query": "q"},
+    }
+    drain(
+        company="shoshin",
+        tier="full",
+        vault=tmp_vault,
+        gbrain=FakePageStore(),
+        paperclip=None,
+        run_hpr=run_hpr,
+        lock_path=tmp_path / "lock",
+        queue_pages=[page],
+        runtime=object(),
+    )
+    assert dest.is_dir()
+    validate_package(dest)
+
+
+def test_index_complete_markdown_keeps_old_row(tmp_vault, monkeypatch):
+    monkeypatch.setenv("GBRAIN_SHOSHIN_BEARER", "tok")
+    tag = "idx-complete"
+    init_run(tmp_vault, tag, company="shoshin")
+    _package(tmp_vault, tag, b"# Title\nhello\n")
+    gbrain = FakePageStore()
+    original = (
+        "---\nreports:\n  - run_id: old\n    slug: old\n"
+        "---\n# Research catalog\nPublished reports for Shoshin.\n"
+    )
+    gbrain.pages["companies/shoshin/research/index"] = {"body": original}
+    publish_package(gbrain, tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
+    puts = [c for c in gbrain.put_calls if c[0] == "companies/shoshin/research/index"]
+    assert puts
+    body = puts[-1][1]["body"]
+    assert isinstance(body, str)
+    assert "run_id: old" in body or "old" in body
+    assert tag in body
+    assert "Research catalog" in body
+
+
+def test_unparseable_index_fails_remote_unchanged(tmp_vault, monkeypatch):
+    monkeypatch.setenv("GBRAIN_SHOSHIN_BEARER", "tok")
+    tag = "idx-bad"
+    init_run(tmp_vault, tag, company="shoshin")
+    _package(tmp_vault, tag, b"# Title\nhello\n")
+    gbrain = FakePageStore()
+    original = "---\nreports: [\n---\n# Research catalog\n"
+    index_slug = "companies/shoshin/research/index"
+    gbrain.pages[index_slug] = {"body": original}
+    out = publish_package(
+        gbrain, tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok"
+    )
+    assert out["publication"]["status"] == "failed"
+    assert out["publication"]["reason"] == "conflict"
+    assert gbrain.pages[index_slug]["body"] == original
+    assert not any(c[0] == index_slug for c in gbrain.put_calls)

@@ -30,7 +30,7 @@ from hyperresearch.pipeline.host_actions import (
     budget_from_profile,
     evidence_content_hash,
     load_evidence,
-    load_snapshots,
+    load_package_evidence,
     run_host_action_loop,
 )
 from hyperresearch.pipeline.patch import PatchOp, PatchSet, apply_patch_set, content_hash
@@ -978,7 +978,7 @@ def _block_if_still_running(
         set_status(vault, tag, "blocked", blocked_on=blocked_on, blocked_reason=blocked_reason)
 
 
-def _verification_from_artifacts(vault: Vault, tag: str) -> dict[str, Any]:
+def _mint_verification(vault: Vault, tag: str, snapshots: list[dict[str, Any]]) -> dict[str, Any]:
     from hyperresearch.pipeline.package import FROZEN_VERIFICATION, verification_of
 
     frozen = vault.run_dir(tag) / FROZEN_VERIFICATION
@@ -988,9 +988,51 @@ def _verification_from_artifacts(vault: Vault, tag: str) -> dict[str, Any]:
             return data
     report = report_path(vault, tag)
     report_bytes = report.read_bytes() if report.is_file() else b""
-    ver = verification_of(report_bytes, load_snapshots(vault, tag))
+    ver = verification_of(report_bytes, snapshots)
     frozen.write_text(json.dumps(ver, indent=2) + "\n", encoding="utf-8")
     return ver
+
+
+def _original_verification(vault: Vault, tag: str) -> dict[str, Any]:
+    from hyperresearch.pipeline.package import FROZEN_VERIFICATION, PackageError
+
+    run_dir = vault.run_dir(tag)
+    frozen = run_dir / FROZEN_VERIFICATION
+    if frozen.is_file():
+        try:
+            data = json.loads(frozen.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise PackageError("artifact_error", "frozen verification is not JSON") from exc
+        if isinstance(data, dict) and data.get("cite_check_bind"):
+            return data
+    cite_data: dict[str, Any] = {}
+    indep_data: dict[str, Any] = {}
+    cite_path = run_dir / CITE_FINDINGS
+    indep_path = run_dir / INDEPENDENCE_ARTIFACT
+    if cite_path.is_file():
+        try:
+            raw = json.loads(cite_path.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError as exc:
+            raise PackageError("artifact_error", "cite-check artifact is not JSON") from exc
+        if isinstance(raw, dict):
+            cite_data = raw
+    if indep_path.is_file():
+        try:
+            raw = json.loads(indep_path.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError as exc:
+            raise PackageError("artifact_error", "independence artifact is not JSON") from exc
+        if isinstance(raw, dict):
+            indep_data = raw
+    report_h = str(cite_data.get("report_hash") or "")
+    evidence_h = str(indep_data.get("evidence_hash") or cite_data.get("evidence_hash") or "")
+    if not report_h or not evidence_h:
+        raise PackageError("artifact_error", "original verification bindings missing")
+    return {
+        "verified_hash": report_h,
+        "cite_check_bind": report_h,
+        "independence_bind": evidence_h,
+        "verified_at": str(cite_data.get("verified_at") or indep_data.get("verified_at") or "recovered"),
+    }
 
 
 def _write_verified_package(vault: Vault, tag: str, company: str) -> dict[str, Any] | None:
@@ -1005,6 +1047,7 @@ def _write_verified_package(vault: Vault, tag: str, company: str) -> dict[str, A
             name="package",
             detail="report missing",
         )
+    snapshots = load_package_evidence(vault, tag)
     try:
         write_package(
             vault.run_dir(tag),
@@ -1012,8 +1055,8 @@ def _write_verified_package(vault: Vault, tag: str, company: str) -> dict[str, A
             company=company,
             run_id=tag,
             report_bytes=report.read_bytes(),
-            snapshots=load_snapshots(vault, tag),
-            verification=_verification_from_artifacts(vault, tag),
+            snapshots=snapshots,
+            verification=_mint_verification(vault, tag, snapshots),
         )
     except PackageError as exc:
         patch_manifest(vault, tag, package={"status": "invalid", "reason": exc.reason})
@@ -1044,13 +1087,14 @@ def _resume_package(vault: Vault, tag: str) -> dict[str, Any] | None:
             return {"manifest": manifest, "verify": {"passed": True}, "tag": tag}
         except PackageError:
             try:
+                snapshots = load_package_evidence(vault, tag)
                 rebuild_package(
                     vault.run_dir(tag),
                     company=str(manifest.get("company")),
                     run_id=tag,
                     report_path=report_path(vault, tag),
-                    snapshots=load_snapshots(vault, tag),
-                    verification=_verification_from_artifacts(vault, tag),
+                    snapshots=snapshots,
+                    verification=_original_verification(vault, tag),
                 )
             except PackageError as exc:
                 manifest = patch_manifest(

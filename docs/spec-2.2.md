@@ -2,7 +2,7 @@
 
 Implementer contract. Do not re-grill Spec 1 (host pipeline, ModelRuntime, no wiki-write in the fork) or Spec 1.5 (SearXNG JSON search, crawl4ai fetch). Spec 2.1 (company workflow inside `hpr`) is superseded. Do not implement until the operator says `go`.
 
-**Revision 2.2.6:** PR #3 comments: production drain uses configured `execute_run` (FakeRuntime only explicit/test); host gap validation against durable snapshots + recorded memory searches; package validator checks Spec 1 verification bindings; files isolation is `companies/stark-industries/`; missing company vault fails closed; MCP `isError` is a backend error; envelope `put_raw_data` sends evidence bytes; index merge parses Markdown/YAML; ingest-retry takes the company lock; `workflow.json` is atomic.
+**Revision 2.2.7:** PR #3 second review: worker package recovery uses `run_hpr` / awaited `execute_run` (never drop the coroutine); index YAML is frontmatter-only (Markdown body is not concatenated; unparseable index stops, not empty catalog); recovery never mints new Spec 1 binds; package includes cited web/vault evidence, not only KnowledgeReader snapshots.
 
 Tracker: `/opt/data/.scratch/hyperresearch-fork/`
 Glossary: `CONTEXT.md`
@@ -193,7 +193,7 @@ Do **not** put GBrain report slug, index row, or `published_at` in the engine pa
 - `schema`: `hyperresearch.package.v1`
 - `company`, `run_id`
 - `report`: `{path, sha256}`
-- `snapshots`: `[{document_id, namespace, type, provenance, path, sha256}]`
+- `snapshots`: `[{document_id, namespace, type, provenance, path, sha256}]` — **all cited evidence**, including KnowledgeReader pages **and** web/vault sources recorded in `evidence.json` / `vault.notes_dir`. A verified report that cites `[[src-note]]` must export those source bytes (or a sufficient durable reference) into the package. `load_snapshots` of the KnowledgeReader directory alone is not the package inventory.
 - `verification`: `{verified_hash, cite_check_bind, independence_bind, verified_at}` — the Spec 1 bind hashes/ids that made the run `verified`
 - `package_digest` — inserted **after** hashing
 
@@ -211,7 +211,9 @@ Do not persist worker-visible `verified` without a complete package directory.
 
 #### Crash: `verified` persisted, package missing or incomplete
 
-Rebuild from persisted Spec 1 artifacts already on disk (final report bytes, evidence snapshots, cite-check / independence bind records). No ModelRuntime. Then run the shared validator.
+Rebuild from persisted Spec 1 artifacts already on disk (final report bytes, **all** cited evidence, cite-check / independence bind records). No ModelRuntime. Then run the shared validator.
+
+**Initial bind vs recovery:** creating cite-check / independence hashes from current files is allowed only on the **first** verification. Recovery of an already-`verified` run must **not** mint new binds. It must load the original persisted bindings (`package-verification.json` or the original validated cite-check / independence artifacts). If those frozen bindings are missing, or current report/evidence bytes no longer match them: stop. `package.status=invalid`, `package.reason=artifact_error`. Do not package the changed bytes as `verify.passed=True`.
 
 If those artifacts no longer match the stored verification bindings: stop. `package.status=invalid`, `package.reason=artifact_error`. Do not publish. Do not start another research run.
 
@@ -231,7 +233,7 @@ Resume:
 - Research not `verified` → worker invokes `hpr run` with the recorded `run_id`.
 - Research `verified` and package missing/incomplete:
   - `package.status=invalid` already recorded → **do not** rebuild. Explicit worker rebuild command only.
-  - otherwise rebuild package (above). No ModelRuntime. If rebuild fails: `package.status=invalid`, `package.reason=artifact_error`; queue stays `running` with that package status (not a hot loop). Do not start a second `run_id`.
+  - otherwise rebuild package (above). No ModelRuntime. The production drain path with `runtime` set **must** actually run recovery: use the existing `run_hpr` callback (`asyncio.run` around `execute_run`) or an explicitly awaited recovery helper. Do **not** call async `execute_run` from a sync `_drain_locked` and discard the coroutine. If rebuild fails: `package.status=invalid`, `package.reason=artifact_error`; queue stays `running` with that package status (not a hot loop). Do not start a second `run_id`.
 - No second `run_id` for a claimed queue item.
 
 #### Queue
@@ -254,7 +256,7 @@ Resume:
 - Write workflow `publish-intent` from package + envelope. Order: report `put_page` → raw `put_raw_data` → index merge. Skip the report step only if remote **body hash** equals the envelope’s frozen published report hash (not the engine `package_digest` alone). Matching that hash completes the **report step only**.
 - Raw key `research-<hex SHA-256 of body>` (full hash). Same body = skip. Different body = `raw_conflict`, no overwrite. Set `publication.status=failed`.
 - Existing report whose body hash differs from the envelope’s frozen published bytes = `publication.status=failed`, `reason=conflict`, no overwrite. Engine `package_digest` may be stored on the index row as a pointer to the engine package; it is not the skip/conflict key for `put_page`.
-- Index slug `companies/shoshin/research/index`, type `research-index`, YAML `reports:` of `{slug, run_id, company, title, verified_hash, package_digest, published_at}`. `get_page` may return Markdown with YAML `reports:` (or frontmatter). Decode that representation, preserve existing rows and page metadata, serialize a valid page back. A nested Python dict in the test double is not the production shape. Never a one-element replace. Memory search excludes it.
+- Index slug `companies/shoshin/research/index`, type `research-index`, YAML `reports:` of `{slug, run_id, company, title, verified_hash, package_digest, published_at}`. `get_page` may return a Markdown page with YAML **frontmatter** (opening `---`, YAML, closing `---`, then Markdown body). Parse **only the frontmatter** as YAML. Do **not** concatenate frontmatter with the Markdown body and `yaml.safe_load` the mix (a heading after the closing `---` is `YAMLError` → empty catalog → one-element overwrite). Preserve existing `reports:` rows **and** remaining page metadata/body. If the existing index cannot be parsed, **stop** (`publication.status=failed`, `reason=conflict` or `http`); do **not** treat it as an empty catalog. A nested Python dict in the test double is not the production shape. Never a one-element replace. Memory search excludes it.
 - Queue bookkeeping `put_page` is read–merge–write of the existing queue document. A stub that drops `query` / `run_id` fails.
 
 #### Paperclip (worker only)
@@ -319,6 +321,8 @@ Split suites so core cannot pass by importing GBrain or Paperclip.
 - Fixture change after snapshot does not change the bound hash.
 - `verified` is not worker-visible until `verified-package/` exists; interrupt after Spec 1 `verified` persist and before package replace → rebuild without ModelRuntime; rebuilt package passes the shared validator.
 - Rebuilt package whose report bytes no longer match `verification.cite_check_bind` → `package.status=invalid`, `package.reason=artifact_error`, no ModelRuntime, no second `run_id`. Rebuild must not mint a new bind over the changed bytes.
+- Recovery of a `verified` run with `verified-package/` **and** `package-verification.json` removed, then the final report changed: `artifact_error`; `verify.passed` must not become true on the changed bytes. Do not create new cite/independence hashes from the current files.
+- A full company verified report that cites web or vault `[[src-note]]` evidence exports those source bytes into `verified-package/` (not `snapshots=[]`). Isolating the package directory from the operational vault still contains the cited evidence. Worker raw selection walks those packaged sources.
 - Shared validator given only the package directory (no checkpoint files) accepts a golden package **with Spec 1 verification bindings** and rejects: mutated report file; empty `verification={}`; mismatched cite-check / independence bind.
 - Engine package manifest has no GBrain slug, no index row, no `published_at`.
 - Forced `evidence_read` of an existing Stark Industries slug on a Shoshin run is prohibited.
@@ -335,10 +339,11 @@ Split suites so core cannot pass by importing GBrain or Paperclip.
 - Light-tier `completed` package: worker does not publish and does not POST Librarian.
 - `hr-workflow harvest-gaps --company shoshin` on a fixture wiki page with two Open-gaps lines → two pending `origin=wiki-gap` items; re-harvest adds none; empty Gaps heading → zero items. Takes the company lock (second process fail-immediately).
 - Drain of `running` + `package.status=invalid` does **not** rebuild and does **not** start `hpr`; explicit rebuild command may rebuild once.
+- Drain with `runtime` non-None, queue `verified`, package missing: recovery **runs** (no `coroutine was never awaited`); reconstructed package exists after drain. Engine-only `hpr run resume` does not cover this branch.
 - Skip report `put_page` only when remote body hash equals the envelope frozen published hash; engine `package_digest` equal is not sufficient if published bytes differ.
 - Conflict: remote body hash ≠ envelope frozen published bytes → `publication.reason=conflict`, remote unchanged.
 - Successful new raw write sends **evidence bytes** to `put_raw_data` (key `research-<sha256 of those bytes>`); retry with the same envelope skips. `get_raw_data` exception is not treated as absence and must not overwrite.
-- Index `get_page` returning Markdown with an existing YAML `reports:` row: merge keeps that row plus the new run (not a one-element replace).
+- Index `get_page` returning a complete Markdown page (`---` / YAML `reports:` / `---` / heading + prose): merge keeps the old row plus the new run. YAMLError / unparseable index → `publication.status=failed`, remote unchanged (not an empty catalog).
 - Interrupted `save_workflow` retains the previous valid `workflow.json` (not truncated `{`).
 - Crash after publication, ingest `idle` → first POST.
 - Crash after Paperclip 201 before `ingest.id` → reconcile, no second POST.

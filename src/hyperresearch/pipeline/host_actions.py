@@ -214,6 +214,43 @@ def load_snapshots(vault: Vault, tag: str) -> list[dict[str, Any]]:
             out.append(data)
     return out
 
+
+def load_package_evidence(vault: Vault, tag: str) -> list[dict[str, Any]]:
+    """KR snapshots plus web/vault sources from evidence.json / notes_dir."""
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for snap in load_snapshots(vault, tag):
+        did = str(snap.get("document_id") or snap.get("ref") or "")
+        if did:
+            seen.add(did)
+        out.append(snap)
+    run_dir = vault.run_dir(tag)
+    for src in load_evidence(vault, tag):
+        nid = str(src.get("note_id") or "")
+        if not nid or nid in seen:
+            continue
+        rel = src.get("snapshot_path")
+        npath = run_dir / str(rel) if rel else vault.notes_dir / f"{nid}.md"
+        body = npath.read_text(encoding="utf-8-sig") if npath.exists() else ""
+        provenance = list(src.get("provenance") or [])
+        url = str(src.get("url") or "")
+        if url and url not in provenance:
+            provenance.append(url)
+        out.append(
+            {
+                "ref": src.get("ref") or nid,
+                "document_id": src.get("document_id") or nid,
+                "namespace": src.get("namespace") or "",
+                "type": src.get("type") or "note",
+                "content_hash": src.get("content_hash") or "",
+                "body": body,
+                "provenance": provenance,
+            }
+        )
+        seen.add(nid)
+    return out
+
+
 def evidence_content_hash(vault: Vault, tag: str) -> str:
     """Identity of selected source bytes, not of evidence-digest.md."""
     lines: list[str] = []

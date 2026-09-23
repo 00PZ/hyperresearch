@@ -37,6 +37,10 @@ class WorkflowError(Exception):
         self.code = code
 
 
+class IndexParseError(Exception):
+    pass
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -161,40 +165,52 @@ def _raw_iter(raw: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _parse_index_text(text: str) -> list[dict[str, Any]]:
+def _parse_index_text(text: str) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
     import yaml
 
-    rest = text
-    if text.startswith("---"):
-        parts = text.split("---", 2)
-        if len(parts) >= 3:
-            rest = parts[1] + "\n" + parts[2]
+    from hyperresearch.core.frontmatter import FRONTMATTER_RE
+
+    yaml_str = text
+    md_body = ""
+    match = FRONTMATTER_RE.match(text)
+    if match:
+        yaml_str = match.group(1)
+        md_body = text[match.end() :]
     try:
-        data = yaml.safe_load(rest)
-    except yaml.YAMLError:
-        return []
-    if isinstance(data, dict) and isinstance(data.get("reports"), list):
-        return [r for r in data["reports"] if isinstance(r, dict)]
+        data = yaml.safe_load(yaml_str)
+    except yaml.YAMLError as exc:
+        raise IndexParseError("unparseable index") from exc
+    if data is None:
+        return [], {}, md_body
     if isinstance(data, list):
-        return [r for r in data if isinstance(r, dict)]
-    return []
+        return [r for r in data if isinstance(r, dict)], {}, md_body
+    if isinstance(data, dict):
+        reports = data.get("reports")
+        if reports is None:
+            reports = []
+        if not isinstance(reports, list):
+            raise IndexParseError("unparseable index")
+        return [r for r in reports if isinstance(r, dict)], data, md_body
+    raise IndexParseError("unparseable index")
 
 
-def _index_reports(index: Any) -> list[dict[str, Any]]:
+def _index_catalog(index: Any) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
+    if index is None:
+        return [], {}, ""
     if isinstance(index, str):
         return _parse_index_text(index)
     if not isinstance(index, dict):
-        return []
+        raise IndexParseError("unparseable index")
     if isinstance(index.get("reports"), list):
-        return [r for r in index["reports"] if isinstance(r, dict)]
+        return [r for r in index["reports"] if isinstance(r, dict)], dict(index), ""
     body = index.get("body")
     if isinstance(body, str):
         return _parse_index_text(body)
     if isinstance(body, dict) and isinstance(body.get("reports"), list):
-        return [r for r in body["reports"] if isinstance(r, dict)]
+        return [r for r in body["reports"] if isinstance(r, dict)], dict(body), ""
     if isinstance(body, list):
-        return [r for r in body if isinstance(r, dict)]
-    return []
+        return [r for r in body if isinstance(r, dict)], {}, ""
+    return [], {}, ""
 
 
 def _page_body(page: Any) -> bytes:
@@ -302,7 +318,12 @@ def publish_package(
         pub.update({"status": "failed", "reason": "http", "detail": str(exc)})
         save_workflow(run_dir, state)
         return state
-    reports = _index_reports(index)
+    try:
+        reports, meta, md_body = _index_catalog(index)
+    except IndexParseError:
+        pub.update({"status": "failed", "reason": "conflict"})
+        save_workflow(run_dir, state)
+        return state
     row = dict(envelope["index_row"])
     row["published_at"] = envelope["published_at"]
     row["verified_hash"] = (manifest.get("verification") or {}).get("verified_hash")
@@ -310,7 +331,10 @@ def publish_package(
     reports.append(row)
     import yaml
 
-    index_body = yaml.safe_dump({"reports": reports}, sort_keys=False)
+    payload = dict(meta)
+    payload["reports"] = reports
+    dumped = yaml.safe_dump(payload, sort_keys=False)
+    index_body = f"---\n{dumped}---\n{md_body}" if md_body else dumped
     gbrain.put_page(INDEX_SLUG, type="research-index", body=index_body)
     pub["status"] = "ok"
     save_workflow(run_dir, state)
@@ -639,20 +663,10 @@ def _drain_locked(
             results.append({"run_id": run_id, "action": "light-skip"})
             continue
         if not complete:
-            if research_status == "verified":
-                from hyperresearch.pipeline.orchestrator import execute_run
-
-                execute_run(
-                    vault,
-                    str(item.get("query") or ""),
-                    runtime,
-                    profile="full",
-                    tag=str(run_id),
-                    resume=True,
-                    company=company,
-                ) if runtime is not None else run_hpr(str(item.get("query") or ""), str(run_id), resume=True)
-            else:
-                run_hpr(str(item.get("query") or ""), str(run_id), resume=status == "running" and manifest is not None)
+            resume = research_status == "verified" or (
+                status == "running" and manifest is not None
+            )
+            run_hpr(str(item.get("query") or ""), str(run_id), resume=resume)
             try:
                 from hyperresearch.core.runs import load_manifest
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 
@@ -16,10 +17,15 @@ from hyperresearch.pipeline.knowledge import (
 )
 
 DEFAULT_MCP_URL = "https://brain-jarvis-company.tail8ab21.ts.net/mcp"
+_JSON_TOOLS = frozenset({"search", "list_pages", "get_page", "get_raw_data"})
+_SEARCH_ARGS = frozenset({"limit", "offset", "types", "source_id"})
+_LIST_ARGS = frozenset({"type", "tag", "limit", "offset", "sort", "updated_after", "source_id"})
 
 
 class GBrainError(Exception):
-    pass
+    def __init__(self, message: str, code: str = "") -> None:
+        super().__init__(message or code)
+        self.code = code or message
 
 
 class GBrainClient:
@@ -50,92 +56,165 @@ class GBrainClient:
 
     def call(self, name: str, arguments: dict[str, Any]) -> Any:
         self._rpc_id += 1
+        rpc_id = self._rpc_id
         payload = {
             "jsonrpc": "2.0",
-            "id": self._rpc_id,
+            "id": rpc_id,
             "method": "tools/call",
             "params": {"name": name, "arguments": arguments},
         }
         response = self._client.post(self.url, json=payload)
         if response.status_code >= 400:
             raise GBrainError(f"http:{response.status_code}")
-        data = response.json()
-        if not isinstance(data, dict):
-            raise GBrainError("http:non_object")
+        data = _rpc_message(response, rpc_id)
         if data.get("error"):
             raise GBrainError(str(data["error"]))
-        result = data.get("result")
-        if isinstance(result, dict) and result.get("isError"):
-            raise GBrainError(_error_text(result) or "mcp:isError")
-        if isinstance(result, dict) and "structuredContent" in result:
-            return result["structuredContent"]
-        if isinstance(result, dict) and "content" in result:
-            content = result["content"]
-            if isinstance(content, list) and content and isinstance(content[0], dict):
-                text = content[0].get("text")
-                if isinstance(text, str):
-                    return text
-            return content
-        return result
+        return _decode_result(name, data.get("result"))
 
-    def get_page(self, slug: str) -> Any:
-        return self.call("get_page", {"slug": slug})
+    def get_page(self, slug: str, include_content: bool | None = None) -> Any:
+        args: dict[str, Any] = {"slug": slug}
+        if include_content is not None:
+            args["include_content"] = include_content
+        try:
+            return self.call("get_page", args)
+        except GBrainError as exc:
+            if exc.code == "page_not_found":
+                return None
+            raise
 
-    def get_raw_data(self, key: str) -> Any:
-        return self.call("get_raw_data", {"key": key})
+    def get_raw_data(self, slug: str, source: str | None = None) -> Any:
+        args: dict[str, Any] = {"slug": slug}
+        if source is not None:
+            args["source"] = source
+        return self.call("get_raw_data", args)
 
-    def put_page(self, slug: str, **kwargs: Any) -> Any:
-        """Unconditional replace. No if-match."""
-        args = {"slug": slug, **kwargs}
-        args.pop("if_match", None)
-        args.pop("ifMatch", None)
-        return self.call("put_page", args)
+    def put_page(self, slug: str, content: str) -> Any:
+        return self.call("put_page", {"slug": slug, "content": content})
 
-    def put_raw_data(self, key: str, body: bytes | str, **kwargs: Any) -> Any:
-        payload = body.decode("utf-8") if isinstance(body, bytes) else body
-        return self.call("put_raw_data", {"key": key, "body": payload, **kwargs})
+    def put_raw_data(self, slug: str, source: str, data: dict[str, Any]) -> Any:
+        return self.call("put_raw_data", {"slug": slug, "source": source, "data": data})
 
     def search(self, query: str, **kwargs: Any) -> Any:
-        return self.call("search", {"query": query, **kwargs})
+        args: dict[str, Any] = {"query": query}
+        for key in _SEARCH_ARGS:
+            if key in kwargs and kwargs[key] is not None:
+                args[key] = kwargs[key]
+        return self.call("search", args)
 
     def list_pages(self, **kwargs: Any) -> Any:
-        return self.call("list_pages", dict(kwargs))
+        args = {k: v for k, v in kwargs.items() if k in _LIST_ARGS and v is not None}
+        return self.call("list_pages", args)
+
+    def list_pages_by_prefix(
+        self,
+        prefix: str,
+        *,
+        type: str | None = None,
+        limit: int = 100,
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        page_size = min(max(int(limit), 1), 100)
+        offset = 0
+        matched: list[dict[str, Any]] = []
+        while True:
+            args: dict[str, Any] = {"limit": page_size, "offset": offset, **kwargs}
+            if type is not None:
+                args["type"] = type
+            rows = self.list_pages(**args)
+            if not isinstance(rows, list):
+                raise GBrainError("unrecognized list_pages payload")
+            for row in rows:
+                if isinstance(row, dict) and str(row.get("slug") or "").startswith(prefix):
+                    matched.append(row)
+            if len(rows) < page_size:
+                return matched
+            offset += len(rows)
 
 
-def _error_text(result: dict[str, Any]) -> str:
+def _rpc_message(response: httpx.Response, rpc_id: int) -> dict[str, Any]:
+    ctype = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if ctype == "text/event-stream":
+        msg = _sse_message(response.text, rpc_id)
+    elif ctype == "application/json":
+        try:
+            parsed = response.json()
+        except json.JSONDecodeError as exc:
+            raise GBrainError("transport:invalid_json") from exc
+        if not isinstance(parsed, dict) or parsed.get("id") != rpc_id:
+            raise GBrainError("transport:id")
+        msg = parsed
+    else:
+        raise GBrainError("transport:content_type")
+    return msg
+
+
+def _sse_message(text: str, rpc_id: int) -> dict[str, Any]:
+    for line in text.splitlines():
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload:
+            continue
+        try:
+            msg = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(msg, dict) and msg.get("id") == rpc_id:
+            return msg
+    raise GBrainError("transport:no_matching_message")
+
+
+def _content_text(result: dict[str, Any]) -> str | None:
     content = result.get("content")
     if isinstance(content, list) and content and isinstance(content[0], dict):
         text = content[0].get("text")
-        if isinstance(text, str) and text:
+        if isinstance(text, str):
             return text
-    return str(result.get("error") or "")
-
-
-def _pages_from(result: Any) -> list[dict[str, Any]] | None:
-    if isinstance(result, list):
-        return [p for p in result if isinstance(p, dict)]
-    if isinstance(result, dict):
-        for key in ("pages", "hits", "results", "items"):
-            value = result.get(key)
-            if isinstance(value, list):
-                return [p for p in value if isinstance(p, dict)]
-        return None
     return None
 
 
-def _slug_of(page: dict[str, Any]) -> str:
-    return str(page.get("slug") or page.get("id") or page.get("ref") or "")
+def _decode_result(name: str, result: Any) -> Any:
+    if not isinstance(result, dict):
+        if name in _JSON_TOOLS:
+            raise GBrainError("transport:bad_result")
+        return result
+    if result.get("isError"):
+        code, message = _iserror(result)
+        raise GBrainError(message, code)
+    structured = result.get("structuredContent")
+    if isinstance(structured, (dict, list)):
+        return structured
+    if isinstance(structured, str) and name in _JSON_TOOLS:
+        try:
+            return json.loads(structured)
+        except json.JSONDecodeError as exc:
+            raise GBrainError("non_json") from exc
+    text = _content_text(result)
+    if name in _JSON_TOOLS:
+        if text is None:
+            raise GBrainError("non_json")
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise GBrainError("non_json") from exc
+    if text is None:
+        return result
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
 
 
-def _type_of(slug: str, page: dict[str, Any]) -> str:
-    declared = str(page.get("type") or "")
-    if declared:
-        return declared
-    if slug.startswith(SHOSHIN_REPORT_PREFIX):
-        return "research-report"
-    if slug.startswith(SHOSHIN_WIKI_PREFIX):
-        return "wiki"
-    return ""
+def _iserror(result: dict[str, Any]) -> tuple[str, str]:
+    text = _content_text(result) or ""
+    try:
+        payload = json.loads(text) if text else {}
+    except json.JSONDecodeError:
+        payload = {}
+    if isinstance(payload, dict) and payload.get("error"):
+        code = str(payload["error"])
+        return code, str(payload.get("message") or code)
+    return "mcp:isError", text or "mcp:isError"
 
 
 def _allowed_slug(slug: str) -> bool:
@@ -144,6 +223,17 @@ def _allowed_slug(slug: str) -> bool:
     if slug.startswith(SHOSHIN_SKIP_PREFIXES):
         return False
     return slug.startswith(SHOSHIN_WIKI_PREFIX) or slug.startswith(SHOSHIN_REPORT_PREFIX)
+
+
+def _provenance(frontmatter: Any) -> list[str]:
+    if not isinstance(frontmatter, dict):
+        return []
+    raw = frontmatter.get("provenance")
+    if not isinstance(raw, list):
+        raw = frontmatter.get("sources")
+    if not isinstance(raw, list):
+        return []
+    return [str(item) for item in raw if isinstance(item, str)]
 
 
 class GBrainReader:
@@ -164,32 +254,40 @@ class GBrainReader:
         return cls(GBrainClient(url, bearer, transport=transport))
 
     def search(self, query: str, scope: str | None = None) -> dict[str, Any]:
+        del scope
         try:
-            result = self.client.search(query, scope=scope) if scope else self.client.search(query)
+            result = self.client.search(query)
         except (GBrainError, httpx.HTTPError, ValueError, TypeError) as exc:
             return error_result(str(exc))
-        pages = _pages_from(result)
-        if pages is None:
+        if not isinstance(result, list):
             return error_result("unrecognized search payload")
-        hits: list[dict[str, Any]] = []
-        for page in pages:
-            slug = _slug_of(page)
+        best: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        for chunk in result:
+            if not isinstance(chunk, dict):
+                continue
+            slug = str(chunk.get("slug") or "")
             if not _allowed_slug(slug):
                 continue
-            provenance = page.get("provenance") or []
-            if not isinstance(provenance, list):
-                provenance = []
-            hits.append(
-                {
-                    "ref": slug,
-                    "namespace": self.namespace,
-                    "document_id": slug,
-                    "type": _type_of(slug, page),
-                    "content_hash": str(page.get("content_hash") or page.get("hash") or ""),
-                    "provenance": [str(p) for p in provenance if p],
-                    "title": page.get("title"),
-                }
-            )
+            prev = best.get(slug)
+            score = float(chunk.get("score") or 0)
+            if prev is None:
+                best[slug] = chunk
+                order.append(slug)
+            elif score > float(prev.get("score") or 0):
+                best[slug] = chunk
+        hits: list[dict[str, Any]] = [
+            {
+                "ref": slug,
+                "namespace": self.namespace,
+                "document_id": slug,
+                "type": str(best[slug].get("type") or ""),
+                "content_hash": str(best[slug].get("content_hash") or ""),
+                "provenance": [],
+                "title": best[slug].get("title"),
+            }
+            for slug in order
+        ]
         return {"ok": True, "hits": hits, "hit_count": len(hits)}
 
     def get(self, ref: str) -> dict[str, Any]:
@@ -199,27 +297,16 @@ class GBrainReader:
             page = self.client.get_page(ref)
         except (GBrainError, httpx.HTTPError, ValueError, TypeError) as exc:
             return {**error_result(str(exc)), "ref": ref}
+        if page is None:
+            return {"ok": False, "error": "note_not_found", "ref": ref}
         if not isinstance(page, dict):
-            body = str(page or "")
-            return {
-                "ok": True,
-                "body": body,
-                "namespace": self.namespace,
-                "document_id": ref,
-                "type": _type_of(ref, {}),
-                "content_hash": "",
-                "provenance": [],
-            }
-        body = str(page.get("body") or page.get("content") or "")
-        provenance = page.get("provenance") or []
-        if not isinstance(provenance, list):
-            provenance = []
+            return {**error_result("unrecognized get_page payload"), "ref": ref}
         return {
             "ok": True,
-            "body": body,
+            "body": str(page.get("compiled_truth") or ""),
             "namespace": self.namespace,
             "document_id": str(page.get("slug") or ref),
-            "type": _type_of(ref, page),
-            "content_hash": str(page.get("content_hash") or page.get("hash") or ""),
-            "provenance": [str(p) for p in provenance if p],
+            "type": str(page.get("type") or ""),
+            "content_hash": str(page.get("content_hash") or ""),
+            "provenance": _provenance(page.get("frontmatter")),
         }

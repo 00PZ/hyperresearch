@@ -98,8 +98,6 @@ def drain_cmd(
 
     try:
         gbrain = _gbrain()
-        pages = gbrain.list_pages(prefix="companies/shoshin/research/queue/")
-        queue = pages if isinstance(pages, list) else (pages or {}).get("pages") or []
         paperclip = httpx.Client(timeout=30.0)
         drain(
             company=company,
@@ -109,7 +107,6 @@ def drain_cmd(
             paperclip=paperclip,
             run_hpr=run_hpr,
             lock_path=lock_path,
-            queue_pages=queue,
             runtime=runtime,
         )
     except WorkflowError as exc:

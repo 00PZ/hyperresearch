@@ -1,0 +1,3 @@
+event: message
+data: {"result":{"content":[{"type":"text","text":"{\n  \"error\": \"page_not_found\",\n  \"message\": \"Page not found: companies/shoshin/research/reports/nope\",\n  \"suggestion\": \"Page may be soft-deleted; pass include_deleted: true to verify\"\n}"}],"isError":true},"jsonrpc":"2.0","id":1}
+

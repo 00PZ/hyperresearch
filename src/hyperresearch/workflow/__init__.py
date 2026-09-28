@@ -14,6 +14,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import yaml
+
+from hyperresearch.core.frontmatter import FRONTMATTER_RE
 from hyperresearch.pipeline.knowledge import SHOSHIN_WIKI_PREFIX
 from hyperresearch.pipeline.package import PackageError, package_path, validate_package
 
@@ -55,6 +58,38 @@ def _body_bytes(value: Any) -> bytes:
     if isinstance(value, str):
         return value.encode("utf-8")
     return json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")
+
+
+def _markdown(meta: dict[str, Any], body: str = "") -> str:
+    dumped = yaml.safe_dump(meta, sort_keys=False, allow_unicode=True)
+    return f"---\n{dumped}---\n{body}"
+
+
+def _mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+
+def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
+    match = FRONTMATTER_RE.match(text)
+    if not match:
+        raise IndexParseError("unparseable index")
+    try:
+        data = yaml.safe_load(match.group(1))
+    except yaml.YAMLError as exc:
+        raise IndexParseError("unparseable index") from exc
+    if data is None:
+        return {}, text[match.end() :]
+    if not isinstance(data, dict):
+        raise IndexParseError("unparseable index")
+    return data, text[match.end() :]
+
+
+def _frontmatter_and_rest(page: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    content = page.get("content")
+    if not isinstance(content, str):
+        raise IndexParseError("unparseable index")
+    return _parse_frontmatter(content)
 
 
 @contextmanager
@@ -109,7 +144,7 @@ def freeze_envelope(
     if raw_items is not None:
         raw = list(raw_items)
     else:
-        raw = [{"sha256": _sha(v)} for v in (raw_bodies or {}).values()]
+        raw = [{"sha256": _sha(v), "body": v.decode("utf-8")} for v in (raw_bodies or {}).values()]
     return {
         "slug": f"{REPORT_PREFIX}{run_id}",
         "title": title,
@@ -147,79 +182,30 @@ def _raw_items_from_package(dest: Path, manifest: dict[str, Any]) -> list[dict[s
         if not rel or not spath.is_file():
             continue
         body = _evidence_bytes(spath)
-        items.append({"sha256": _sha(body), "path": rel})
+        items.append(
+            {
+                "sha256": _sha(body),
+                "path": rel,
+                "document_id": snap.get("document_id"),
+                "namespace": snap.get("namespace"),
+                "type": snap.get("type"),
+                "provenance": snap.get("provenance") or [],
+                "body": body.decode("utf-8"),
+            }
+        )
     return items
 
 
 def _raw_iter(raw: Any) -> list[dict[str, Any]]:
     if isinstance(raw, list):
-        return [item if isinstance(item, dict) else {"sha256": str(item)} for item in raw]
-    if isinstance(raw, dict):
-        items: list[dict[str, Any]] = []
-        for key, value in raw.items():
-            if isinstance(value, dict):
-                items.append(value)
-            else:
-                items.append({"sha256": str(key)})
-        return items
+        return [item for item in raw if isinstance(item, dict)]
     return []
 
 
-def _parse_index_text(text: str) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
-    import yaml
-
-    from hyperresearch.core.frontmatter import FRONTMATTER_RE
-
-    yaml_str = text
-    md_body = ""
-    match = FRONTMATTER_RE.match(text)
-    if match:
-        yaml_str = match.group(1)
-        md_body = text[match.end() :]
-    try:
-        data = yaml.safe_load(yaml_str)
-    except yaml.YAMLError as exc:
-        raise IndexParseError("unparseable index") from exc
-    if data is None:
-        return [], {}, md_body
-    if isinstance(data, list):
-        return [r for r in data if isinstance(r, dict)], {}, md_body
-    if isinstance(data, dict):
-        reports = data.get("reports")
-        if reports is None:
-            reports = []
-        if not isinstance(reports, list):
-            raise IndexParseError("unparseable index")
-        return [r for r in reports if isinstance(r, dict)], data, md_body
-    raise IndexParseError("unparseable index")
-
-
-def _index_catalog(index: Any) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
-    if index is None:
-        return [], {}, ""
-    if isinstance(index, str):
-        return _parse_index_text(index)
-    if not isinstance(index, dict):
-        raise IndexParseError("unparseable index")
-    if isinstance(index.get("reports"), list):
-        return [r for r in index["reports"] if isinstance(r, dict)], dict(index), ""
-    body = index.get("body")
-    if isinstance(body, str):
-        return _parse_index_text(body)
-    if isinstance(body, dict) and isinstance(body.get("reports"), list):
-        return [r for r in body["reports"] if isinstance(r, dict)], dict(body), ""
-    if isinstance(body, list):
-        return [r for r in body if isinstance(r, dict)], {}, ""
-    return [], {}, ""
-
-
-def _page_body(page: Any) -> bytes:
-    if isinstance(page, dict):
-        if "body" in page:
-            return _body_bytes(page.get("body") or "")
-        if "content" in page:
-            return _body_bytes(page.get("content") or "")
-    return _body_bytes(page or "")
+def _fail_pub(state: dict[str, Any], pub: dict[str, Any], run_dir: Path, **fields: Any) -> dict[str, Any]:
+    pub.update(fields)
+    save_workflow(run_dir, state)
+    return state
 
 
 def publish_package(
@@ -233,17 +219,13 @@ def publish_package(
     state = load_workflow(run_dir)
     pub = state.setdefault("publication", {"status": "idle"})
     if not bearer:
-        pub.update({"status": "failed", "reason": "unconfigured"})
-        save_workflow(run_dir, state)
-        return state
+        return _fail_pub(state, pub, run_dir, status="failed", reason="unconfigured")
     dest = package_path(run_dir)
     try:
         manifest = validate_package(dest)
     except PackageError as exc:
         reason = "stale_bindings" if exc.reason == "stale_bindings" else "artifact_error"
-        pub.update({"status": "failed", "reason": reason})
-        save_workflow(run_dir, state)
-        return state
+        return _fail_pub(state, pub, run_dir, status="failed", reason=reason)
     envelope = pub.get("envelope")
     if not isinstance(envelope, dict):
         report = (dest / str((manifest.get("report") or {}).get("path") or "report.md")).read_bytes()
@@ -268,74 +250,111 @@ def publish_package(
     try:
         remote = gbrain.get_page(slug)
     except Exception as exc:
-        pub.update({"status": "failed", "reason": "http", "detail": str(exc)})
-        save_workflow(run_dir, state)
-        return state
-    remote_bytes = _page_body(remote) if remote else b""
-    skip_report = bool(remote) and _sha(remote_bytes) == published_hash
-    if remote and remote_bytes and _sha(remote_bytes) != published_hash:
-        pub.update({"status": "failed", "reason": "conflict"})
-        save_workflow(run_dir, state)
-        return state
-    if not skip_report:
-        gbrain.put_page(
-            slug,
-            body=envelope.get("published_report") or "",
-            type="research-report",
-            title=envelope.get("title"),
-        )
-    pub["status"] = "partial"
-    save_workflow(run_dir, state)
-    for item in _raw_iter(envelope.get("raw")):
-        body_hash = str(item.get("sha256") or "")
-        if not body_hash:
-            continue
-        key = f"research-{body_hash}"
-        try:
-            existing = gbrain.get_raw_data(key)
-        except Exception as exc:
-            pub.update({"status": "failed", "reason": "http", "detail": str(exc)})
-            save_workflow(run_dir, state)
-            return state
-        if existing is not None:
-            got = _body_bytes(existing if not isinstance(existing, dict) else existing.get("body") or existing)
-            if _sha(got) != body_hash:
-                pub.update({"status": "failed", "reason": "raw_conflict"})
-                save_workflow(run_dir, state)
-                return state
-            continue
-        rel = str(item.get("path") or "")
-        if rel:
-            body = _evidence_bytes(dest / rel)
-        elif item.get("body") is not None:
-            body = _body_bytes(item.get("body"))
+        return _fail_pub(state, pub, run_dir, status="failed", reason="http", detail=str(exc))
+    if remote is None:
+        skip_report = False
+    elif isinstance(remote, dict):
+        fm = _mapping(remote.get("frontmatter"))
+        remote_sha = fm.get("published_sha256")
+        if remote_sha == published_hash:
+            skip_report = True
         else:
-            continue
-        gbrain.put_raw_data(key, body)
+            return _fail_pub(state, pub, run_dir, status="failed", reason="conflict")
+    else:
+        return _fail_pub(state, pub, run_dir, status="failed", reason="conflict")
+    verification = manifest.get("verification") or {}
     try:
-        index = gbrain.get_page(INDEX_SLUG)
+        if not skip_report:
+            gbrain.put_page(
+                slug,
+                _markdown(
+                    {
+                        "type": "research-report",
+                        "title": envelope.get("title"),
+                        "run_id": run_id,
+                        "company": company,
+                        "verified_hash": verification.get("verified_hash"),
+                        "package_digest": envelope["index_row"].get("package_digest"),
+                        "published_sha256": published_hash,
+                    },
+                    envelope.get("published_report") or "",
+                ),
+            )
+        pub["status"] = "partial"
+        save_workflow(run_dir, state)
+        for item in _raw_iter(envelope.get("raw")):
+            body_hash = str(item.get("sha256") or "")
+            if not body_hash:
+                continue
+            source = f"research-{body_hash}"
+            try:
+                existing = gbrain.get_raw_data(slug, source)
+            except Exception as exc:
+                return _fail_pub(state, pub, run_dir, status="failed", reason="http", detail=str(exc))
+            if existing is None:
+                return _fail_pub(state, pub, run_dir, status="failed", reason="http", detail="raw:non_list")
+            if not isinstance(existing, list):
+                return _fail_pub(state, pub, run_dir, status="failed", reason="http", detail="raw:non_list")
+            if existing:
+                row = existing[0] if isinstance(existing[0], dict) else {}
+                data = _mapping(row.get("data"))
+                got_sha = data.get("sha256")
+                if got_sha == body_hash:
+                    continue
+                return _fail_pub(state, pub, run_dir, status="failed", reason="raw_conflict")
+            if item.get("body") is not None:
+                body_text = item["body"] if isinstance(item["body"], str) else _body_bytes(item["body"]).decode("utf-8")
+            elif item.get("path"):
+                body_text = _evidence_bytes(dest / str(item["path"])).decode("utf-8")
+            else:
+                continue
+            gbrain.put_raw_data(
+                slug,
+                source,
+                {
+                    "sha256": body_hash,
+                    "document_id": item.get("document_id"),
+                    "namespace": item.get("namespace"),
+                    "type": item.get("type"),
+                    "provenance": item.get("provenance") or [],
+                    "body": body_text,
+                },
+            )
+        try:
+            index = gbrain.get_page(INDEX_SLUG, include_content=True)
+        except Exception as exc:
+            return _fail_pub(state, pub, run_dir, status="failed", reason="http", detail=str(exc))
+        meta: dict[str, Any]
+        md_body: str
+        reports: list[dict[str, Any]]
+        if index is None:
+            meta, md_body = {}, ""
+            reports = []
+        elif not isinstance(index, dict):
+            return _fail_pub(state, pub, run_dir, status="failed", reason="conflict")
+        else:
+            try:
+                meta, md_body = _frontmatter_and_rest(index)
+            except IndexParseError:
+                return _fail_pub(state, pub, run_dir, status="failed", reason="conflict")
+            reports_raw = meta.get("reports")
+            if reports_raw is None:
+                reports = []
+            elif not isinstance(reports_raw, list):
+                return _fail_pub(state, pub, run_dir, status="failed", reason="conflict")
+            else:
+                reports = [r for r in reports_raw if isinstance(r, dict)]
+        row = dict(envelope["index_row"])
+        row["published_at"] = envelope["published_at"]
+        row["verified_hash"] = verification.get("verified_hash")
+        reports = [r for r in reports if r.get("run_id") != run_id]
+        reports.append(row)
+        payload = dict(meta)
+        payload["type"] = payload.get("type") or "research-index"
+        payload["reports"] = reports
+        gbrain.put_page(INDEX_SLUG, _markdown(payload, md_body))
     except Exception as exc:
-        pub.update({"status": "failed", "reason": "http", "detail": str(exc)})
-        save_workflow(run_dir, state)
-        return state
-    try:
-        reports, meta, md_body = _index_catalog(index)
-    except IndexParseError:
-        pub.update({"status": "failed", "reason": "conflict"})
-        save_workflow(run_dir, state)
-        return state
-    row = dict(envelope["index_row"])
-    row["published_at"] = envelope["published_at"]
-    row["verified_hash"] = (manifest.get("verification") or {}).get("verified_hash")
-    reports = [r for r in reports if isinstance(r, dict) and r.get("run_id") != run_id]
-    reports.append(row)
-    import yaml
-
-    payload = dict(meta)
-    payload["reports"] = reports
-    dumped = yaml.safe_dump(payload, sort_keys=False)
-    index_body = f"---\n{dumped}---\n{md_body}" if md_body else dumped
-    gbrain.put_page(INDEX_SLUG, type="research-index", body=index_body)
+        return _fail_pub(state, pub, run_dir, status="failed", reason="http", detail=str(exc))
     pub["status"] = "ok"
     save_workflow(run_dir, state)
     return state
@@ -447,71 +466,51 @@ def dispatch_ingest(
 
 
 def merge_queue(gbrain: Any, slug: str, **fields: Any) -> dict[str, Any]:
-    page = gbrain.get_page(slug) or {}
-    if not isinstance(page, dict):
-        page = {"body": page}
-    raw_body = page.get("body")
-    body: dict[str, Any] = raw_body if isinstance(raw_body, dict) else dict(page)
-    for key in ("query", "run_id", "origin", "wiki_slug", "gap_text", "dedup_hash"):
-        if key in body and key not in fields:
-            fields.setdefault(key, body[key])
-    merged = {**body, **fields}
+    page = gbrain.get_page(slug, include_content=True)
+    fm: dict[str, Any]
+    rest: str
+    if isinstance(page, dict):
+        try:
+            fm, rest = _frontmatter_and_rest(page)
+        except IndexParseError:
+            fm, rest = _mapping(page.get("frontmatter")), ""
+    else:
+        fm, rest = {}, ""
+    merged = {**fm, **fields, "type": "research-queue"}
     if "query" not in merged or "run_id" not in merged:
         raise WorkflowError("queue put_page dropped query/run_id")
-    gbrain.put_page(slug, type="research-queue", **merged, body=merged)
+    gbrain.put_page(slug, _markdown(merged, rest))
     return merged
 
 
 def wiki_draft(gbrain: Any, research_slug: str) -> str:
     page = gbrain.get_page(research_slug)
-    body = page.get("body") if isinstance(page, dict) else page
-    return str(body or "")
+    if isinstance(page, dict):
+        return str(page.get("compiled_truth") or "")
+    return str(page or "")
+
+
+def load_queue_pages(gbrain: Any) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for row in gbrain.list_pages_by_prefix(QUEUE_PREFIX, type="research-queue"):
+        slug = str(row.get("slug") or "")
+        if not slug:
+            continue
+        page = gbrain.get_page(slug, include_content=True)
+        if not isinstance(page, dict):
+            continue
+        try:
+            fm, _rest = _frontmatter_and_rest(page)
+        except IndexParseError:
+            fm = _mapping(page.get("frontmatter"))
+        items.append({"slug": slug, **fm})
+    return items
+
 
 
 _LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.*)$")
 _DASH_ONLY = re.compile(r"^[\-\u2013\u2014\u2212*·.\s]+$")
 _SKU = re.compile(r"^sku\b", re.I)
-
-
-def _list_pages(gbrain: Any, **kwargs: Any) -> list[dict[str, Any]]:
-    result = gbrain.list_pages(**kwargs)
-    if isinstance(result, list):
-        return [p for p in result if isinstance(p, dict)]
-    if isinstance(result, dict):
-        for key in ("pages", "hits", "results", "items"):
-            value = result.get(key)
-            if isinstance(value, list):
-                return [p for p in value if isinstance(p, dict)]
-    return []
-
-
-def _page_item(page: dict[str, Any]) -> dict[str, Any]:
-    raw = page.get("body")
-    return {**page, **raw} if isinstance(raw, dict) else page
-
-
-def _page_text(gbrain: Any, page: dict[str, Any]) -> str:
-    body = page.get("body")
-    if isinstance(body, str) and body:
-        return body
-    if isinstance(body, dict):
-        text = body.get("body") or body.get("content")
-        if text:
-            return str(text)
-    slug = str(page.get("slug") or "")
-    if not slug:
-        return ""
-    fetched = gbrain.get_page(slug)
-    if isinstance(fetched, str):
-        return fetched
-    if not isinstance(fetched, dict):
-        return str(fetched or "")
-    inner = fetched.get("body")
-    if isinstance(inner, str):
-        return inner
-    if isinstance(inner, dict):
-        return str(inner.get("body") or inner.get("content") or "")
-    return str(fetched.get("content") or "")
 
 
 def _skip_gap(text: str, wiki_slug: str) -> bool:
@@ -555,24 +554,34 @@ def harvest_gaps(*, company: str, gbrain: Any, lock_path: Path) -> dict[str, Any
 
 def _harvest_locked(gbrain: Any) -> dict[str, Any]:
     existing: set[str] = set()
-    for page in _list_pages(gbrain, prefix=QUEUE_PREFIX):
-        digest = str(_page_item(page).get("dedup_hash") or "")
+    for row in gbrain.list_pages_by_prefix(QUEUE_PREFIX, type="research-queue"):
+        slug = str(row.get("slug") or "")
+        page = gbrain.get_page(slug, include_content=True) if slug else None
+        if not isinstance(page, dict):
+            continue
+        try:
+            fm, _rest = _frontmatter_and_rest(page)
+        except IndexParseError:
+            fm = _mapping(page.get("frontmatter"))
+        digest = str(fm.get("dedup_hash") or "")
         if digest:
             existing.add(digest)
     added: list[dict[str, Any]] = []
-    for page in _list_pages(gbrain, prefix=SHOSHIN_WIKI_PREFIX):
-        item = _page_item(page)
-        slug = str(page.get("slug") or item.get("slug") or "")
+    for row in gbrain.list_pages_by_prefix(SHOSHIN_WIKI_PREFIX):
+        slug = str(row.get("slug") or "")
         if not slug.startswith(SHOSHIN_WIKI_PREFIX):
             continue
-        if str(item.get("type") or "") != "wiki":
+        page = gbrain.get_page(slug)
+        if not isinstance(page, dict):
             continue
-        for gap_text in _parse_wiki_gaps(_page_text(gbrain, page), slug):
+        text = str(page.get("compiled_truth") or "")
+        for gap_text in _parse_wiki_gaps(text, slug):
             digest = _sha(f"{slug}{gap_text}".encode())
             if digest in existing:
                 continue
             existing.add(digest)
             payload = {
+                "type": "research-queue",
                 "origin": "wiki-gap",
                 "query": gap_text,
                 "status": "pending",
@@ -580,7 +589,7 @@ def _harvest_locked(gbrain: Any) -> dict[str, Any]:
                 "gap_text": gap_text,
                 "dedup_hash": digest,
             }
-            gbrain.put_page(f"{QUEUE_PREFIX}{digest}", type="research-queue", **payload, body=payload)
+            gbrain.put_page(f"{QUEUE_PREFIX}{digest}", _markdown(payload))
             added.append(payload)
     return {"ok": True, "added": len(added), "items": added}
 
@@ -594,13 +603,14 @@ def drain(
     paperclip: Any | None,
     run_hpr: Callable[..., Any],
     lock_path: Path,
-    queue_pages: list[dict[str, Any]],
+    queue_pages: list[dict[str, Any]] | None = None,
     runtime: Any | None = None,
 ) -> dict[str, Any]:
     if company != "shoshin":
         raise WorkflowError("unknown company", code=1)
     try:
         with company_lock(lock_path):
+            pages = load_queue_pages(gbrain) if queue_pages is None else queue_pages
             return _drain_locked(
                 company=company,
                 tier=tier,
@@ -608,7 +618,7 @@ def drain(
                 gbrain=gbrain,
                 paperclip=paperclip,
                 run_hpr=run_hpr,
-                queue_pages=queue_pages,
+                queue_pages=pages,
                 runtime=runtime,
             )
     except LockHeldError:
@@ -628,8 +638,7 @@ def _drain_locked(
 ) -> dict[str, Any]:
     results = []
     for page in queue_pages:
-        raw_item = page.get("body")
-        item: dict[str, Any] = raw_item if isinstance(raw_item, dict) else page
+        item: dict[str, Any] = page
         slug = str(page.get("slug") or item.get("slug") or "")
         status = str(item.get("status") or "pending")
         run_id = item.get("run_id")

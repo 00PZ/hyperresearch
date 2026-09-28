@@ -7,8 +7,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
+import yaml
 
+from hyperresearch.core.frontmatter import FRONTMATTER_RE
 from hyperresearch.core.runs import init_run, patch_manifest, set_status
 from hyperresearch.pipeline.package import (
     package_path,
@@ -30,43 +33,156 @@ from hyperresearch.workflow import (
     wiki_draft,
 )
 
+INDEX_SLUG = "companies/shoshin/research/index"
 
-class FakePageStore:
+
+
+def _md(meta: dict[str, Any], body: str = "") -> str:
+    return f"---\n{yaml.safe_dump(meta, sort_keys=False)}---\n{body}"
+
+
+def _page_from_content(slug: str, content: str) -> dict[str, Any]:
+    match = FRONTMATTER_RE.match(content)
+    fm: dict[str, Any] = {}
+    rest = content
+    if match:
+        try:
+            loaded = yaml.safe_load(match.group(1))
+        except yaml.YAMLError:
+            loaded = None
+        if isinstance(loaded, dict):
+            fm = loaded
+        rest = content[match.end() :]
+    return {
+        "id": 1,
+        "slug": slug,
+        "type": fm.get("type"),
+        "title": fm.get("title"),
+        "compiled_truth": rest,
+        "frontmatter": fm,
+        "content": content,
+        "content_hash": hashlib.sha256(content.encode()).hexdigest(),
+        "source_id": "shoshin",
+        "tags": [],
+    }
+
+
+def _sse(rpc_id: int, payload: Any, *, is_error: bool = False) -> httpx.Response:
+    result: dict[str, Any] = {"content": [{"type": "text", "text": json.dumps(payload)}]}
+    if is_error:
+        result["isError"] = True
+    envelope = {"jsonrpc": "2.0", "id": rpc_id, "result": result}
+    body = f"event: message\ndata: {json.dumps(envelope, separators=(',', ':'))}\n\n"
+    return httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
+
+
+def _fixture_payload(name: str) -> Any:
+    path = Path(__file__).resolve().parents[1] / "fixtures" / "gbrain_wire" / name
+    raw = path.read_text(encoding="utf-8")
+    if name.endswith(".json"):
+        text = json.loads(raw)["result"]["content"][0]["text"]
+        return json.loads(text)
+    for line in raw.splitlines():
+        if line.startswith("data:"):
+            msg = json.loads(line[5:].strip())
+            return json.loads(msg["result"]["content"][0]["text"])
+    raise AssertionError(f"no data in {name}")
+
+
+class McpWire:
     def __init__(self) -> None:
         self.pages: dict[str, dict[str, Any]] = {}
-        self.raw: dict[str, bytes] = {}
-        self.put_calls: list[tuple[str, dict[str, Any]]] = []
-        self.raw_puts: list[tuple[str, bytes]] = []
+        self.raw: dict[tuple[str, str], dict[str, Any]] = {}
+        self.calls: list[dict[str, Any]] = []
+        self.raw_error = False
 
-    def get_page(self, slug: str) -> dict[str, Any] | None:
-        return self.pages.get(slug)
+    def client(self) -> Any:
+        from hyperresearch.knowledge.gbrain import GBrainClient
 
-    def put_page(self, slug: str, **kwargs: Any) -> dict[str, Any]:
-        # Unconditional replace. No if-match.
-        self.put_calls.append((slug, dict(kwargs)))
-        body = kwargs.get("body")
-        self.pages[slug] = {"slug": slug, **kwargs, "body": body}
-        return self.pages[slug]
+        return GBrainClient("http://gbrain.test/mcp", "tok", transport=httpx.MockTransport(self))
 
-    def list_pages(self, **kwargs: Any) -> list[dict[str, Any]]:
-        prefix = str(kwargs.get("prefix") or "")
-        typ = kwargs.get("type")
-        pages: list[dict[str, Any]] = []
-        for slug, page in self.pages.items():
-            if prefix and not slug.startswith(prefix):
-                continue
-            if typ and page.get("type") != typ:
-                continue
-            pages.append(page)
-        return pages
+    def seed_markdown(self, slug: str, content: str) -> None:
+        self.pages[slug] = _page_from_content(slug, content)
 
-    def get_raw_data(self, key: str) -> bytes | None:
-        return self.raw.get(key)
+    def seed_page(self, page: dict[str, Any]) -> None:
+        self.pages[str(page["slug"])] = page
 
-    def put_raw_data(self, key: str, body: Any, **kwargs: Any) -> None:
-        raw = body if isinstance(body, bytes) else str(body).encode()
-        self.raw_puts.append((key, raw))
-        self.raw[key] = raw
+    def tool_args(self, name: str) -> list[dict[str, Any]]:
+        return [c["params"]["arguments"] for c in self.calls if c["params"]["name"] == name]
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        self.calls.append(payload)
+        rpc_id = payload["id"]
+        name = payload["params"]["name"]
+        args = payload["params"]["arguments"]
+        if name == "get_page":
+            slug = str(args.get("slug") or "")
+            page = self.pages.get(slug)
+            if page is None:
+                return _sse(
+                    rpc_id,
+                    {"error": "page_not_found", "message": f"Page not found: {slug}"},
+                    is_error=True,
+                )
+            body = dict(page)
+            if not args.get("include_content"):
+                body = {k: v for k, v in body.items() if k != "content"}
+            return _sse(rpc_id, body)
+        if name == "put_page":
+            slug = str(args["slug"])
+            self.pages[slug] = _page_from_content(slug, str(args.get("content") or ""))
+            return _sse(rpc_id, {"slug": slug, "status": "created_or_updated"})
+        if name == "get_raw_data":
+            if self.raw_error:
+                return httpx.Response(500, text="nope")
+            slug = str(args.get("slug") or "")
+            source = args.get("source")
+            if source is None:
+                rows = [
+                    {"source": src, "data": data}
+                    for (s, src), data in self.raw.items()
+                    if s == slug
+                ]
+            else:
+                data = self.raw.get((slug, str(source)))
+                rows = [] if data is None else [{"source": source, "data": data}]
+            return _sse(rpc_id, rows)
+        if name == "put_raw_data":
+            slug = str(args["slug"])
+            source = str(args["source"])
+            data = args["data"]
+            self.raw[(slug, source)] = data if isinstance(data, dict) else {"body": data}
+            return _sse(rpc_id, {"ok": True})
+        if name == "list_pages":
+            typ = args.get("type")
+            rows = []
+            for slug, page in self.pages.items():
+                if typ and page.get("type") != typ:
+                    continue
+                rows.append(
+                    {
+                        "slug": slug,
+                        "source_id": page.get("source_id") or "shoshin",
+                        "type": page.get("type"),
+                        "title": page.get("title") or slug,
+                        "updated_at": "2026-09-28T00:00:00.000Z",
+                    }
+                )
+            offset = int(args.get("offset") or 0)
+            limit = int(args.get("limit") or 100)
+            return _sse(rpc_id, rows[offset : offset + limit])
+        if name == "search":
+            return _sse(rpc_id, [])
+        return _sse(rpc_id, {"error": "invalid_params", "message": name}, is_error=True)
+
+
+def _assert_live_args(wire: McpWire) -> None:
+    for call in wire.calls:
+        args = call["params"]["arguments"]
+        assert "prefix" not in args
+        assert "key" not in args
+        assert "body" not in args
 
 
 class FakePaperclip:
@@ -133,7 +249,7 @@ def test_two_workers_lock(tmp_vault, tmp_path):
             company="shoshin",
             tier="full",
             vault=tmp_vault,
-            gbrain=FakePageStore(),
+            gbrain=McpWire().client(),
             paperclip=FakePaperclip(),
             run_hpr=run_hpr,
             lock_path=lock,
@@ -148,30 +264,29 @@ def test_skip_put_page_uses_envelope_published_hash(tmp_vault, monkeypatch):
     init_run(tmp_vault, tag, company="shoshin")
     report = b"# published body\n"
     _package(tmp_vault, tag, report)
-    gbrain = FakePageStore()
-    env = freeze_envelope(
-        run_id=tag,
-        report_bytes=report,
-        title="t",
-        package_digest="digest-engine",
+    env = freeze_envelope(run_id=tag, report_bytes=report, title="t", package_digest="digest-engine")
+    wire = McpWire()
+    wire.seed_markdown(
+        env["slug"],
+        _md({"type": "research-report", "published_sha256": env["published_report_sha256"]}, report.decode()),
     )
-    # Remote matches published bytes, not engine digest.
-    gbrain.pages[env["slug"]] = {"slug": env["slug"], "body": report.decode()}
     state = load_workflow(tmp_vault.run_dir(tag))
     state["publication"] = {"status": "idle", "envelope": env}
     save_workflow(tmp_vault.run_dir(tag), state)
-    publish_package(gbrain, tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
-    report_puts = [c for c in gbrain.put_calls if c[0] == env["slug"]]
-    assert report_puts == []
-    # engine digest equal is not the skip key — different published bytes conflict
+    publish_package(wire.client(), tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
+    assert [a for a in wire.tool_args("put_page") if a["slug"] == env["slug"]] == []
     other = freeze_envelope(run_id=tag, report_bytes=b"# other published\n", title="t", package_digest="digest-engine")
-    gbrain2 = FakePageStore()
-    gbrain2.pages[other["slug"]] = {"slug": other["slug"], "body": report.decode()}
+    wire2 = McpWire()
+    wire2.seed_markdown(
+        other["slug"],
+        _md({"type": "research-report", "published_sha256": env["published_report_sha256"]}, report.decode()),
+    )
     st = load_workflow(tmp_vault.run_dir(tag))
     st["publication"] = {"status": "idle", "envelope": other}
     save_workflow(tmp_vault.run_dir(tag), st)
-    out = publish_package(gbrain2, tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
+    out = publish_package(wire2.client(), tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
     assert out["publication"]["reason"] == "conflict"
+    assert wire2.tool_args("put_page") == []
 
 
 def test_conflict_on_different_published_bytes(tmp_vault, monkeypatch):
@@ -179,12 +294,15 @@ def test_conflict_on_different_published_bytes(tmp_vault, monkeypatch):
     tag = "pub-conf"
     init_run(tmp_vault, tag, company="shoshin")
     _package(tmp_vault, tag, b"# new\n")
-    gbrain = FakePageStore()
-    gbrain.pages[f"companies/shoshin/research/reports/{tag}"] = {"body": "# old remote\n"}
-    out = publish_package(gbrain, tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
+    slug = f"companies/shoshin/research/reports/{tag}"
+    wire = McpWire()
+    original = _md({"type": "research-report", "published_sha256": "old-hash"}, "# old remote\n")
+    wire.seed_markdown(slug, original)
+    out = publish_package(wire.client(), tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
     assert out["publication"]["status"] == "failed"
     assert out["publication"]["reason"] == "conflict"
-    assert gbrain.pages[f"companies/shoshin/research/reports/{tag}"]["body"] == "# old remote\n"
+    assert wire.pages[slug]["content"] == original
+    assert wire.tool_args("put_page") == []
 
 
 def test_drain_invalid_package_does_not_rebuild(tmp_vault, tmp_path):
@@ -198,24 +316,16 @@ def test_drain_invalid_package_does_not_rebuild(tmp_vault, tmp_path):
         calls.append("hpr")
         raise AssertionError("must not rebuild")
 
-    gbrain = FakePageStore()
     slug = "companies/shoshin/research/queue/q1"
-    gbrain.pages[slug] = {
-        "slug": slug,
-        "body": {"status": "running", "run_id": tag, "query": "q"},
-        "status": "running",
-        "run_id": tag,
-        "query": "q",
-    }
     drain(
         company="shoshin",
         tier="full",
         vault=tmp_vault,
-        gbrain=gbrain,
+        gbrain=McpWire().client(),
         paperclip=FakePaperclip(),
         run_hpr=run_hpr,
         lock_path=tmp_path / "lock",
-        queue_pages=[gbrain.pages[slug]],
+        queue_pages=[{"slug": slug, "status": "running", "run_id": tag, "query": "q"}],
     )
     assert calls == []
 
@@ -247,6 +357,7 @@ def test_ingest_retry_refuses_unless_publication_ok(tmp_vault, tmp_path, monkeyp
         ingest_retry(pc, tmp_vault.run_dir(tag), "companies/shoshin/research/reports/x", tmp_path / "lock")
     assert pc.posts == []
 
+
 def test_light_tier_completed_does_not_post_librarian(tmp_vault, tmp_path, monkeypatch):
     monkeypatch.setenv("GBRAIN_SHOSHIN_BEARER", "tok")
     monkeypatch.setenv("PAPERCLIP_API_URL", "http://paperclip.test")
@@ -256,21 +367,20 @@ def test_light_tier_completed_does_not_post_librarian(tmp_vault, tmp_path, monke
     init_run(tmp_vault, tag, profile="light", company="shoshin")
     set_status(tmp_vault, tag, "completed")
     pc = FakePaperclip()
-    gbrain = FakePageStore()
+    wire = McpWire()
     slug = "companies/shoshin/research/queue/q1"
-    page = {"slug": slug, "status": "running", "run_id": tag, "query": "q", "body": {"status": "running", "run_id": tag, "query": "q"}}
     drain(
         company="shoshin",
         tier="light",
         vault=tmp_vault,
-        gbrain=gbrain,
+        gbrain=wire.client(),
         paperclip=pc,
         run_hpr=lambda *a, **k: None,
         lock_path=tmp_path / "lock",
-        queue_pages=[page],
+        queue_pages=[{"slug": slug, "status": "running", "run_id": tag, "query": "q"}],
     )
     assert pc.posts == []
-    assert gbrain.put_calls == []
+    assert wire.tool_args("put_page") == []
 
 
 def test_crash_after_publish_idle_first_post(tmp_vault, monkeypatch):
@@ -319,12 +429,13 @@ def test_failed_drain_does_not_post_retry_does(tmp_vault, tmp_path, monkeypatch)
     ingest_retry(pc, tmp_vault.run_dir(tag), "s", tmp_path / "lock")
     assert len(pc.posts) == 1
 
+
 def test_missing_bearer_unconfigured_keeps_verified(tmp_vault):
     tag = "pub-unconf"
     init_run(tmp_vault, tag, company="shoshin")
     set_status(tmp_vault, tag, "verified")
     _package(tmp_vault, tag)
-    out = publish_package(FakePageStore(), tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer=None)
+    out = publish_package(McpWire().client(), tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer=None)
     assert out["publication"]["reason"] == "unconfigured"
     assert load_manifest_status(tmp_vault, tag) == "verified"
 
@@ -336,9 +447,10 @@ def load_manifest_status(vault, tag: str) -> str:
 
 
 def test_wiki_draft_reads_research_slug():
-    gbrain = FakePageStore()
-    gbrain.pages["companies/shoshin/research/reports/r1"] = {"body": "REPORT BODY"}
-    assert wiki_draft(gbrain, "companies/shoshin/research/reports/r1") == "REPORT BODY"
+    wire = McpWire()
+    slug = "companies/shoshin/research/reports/r1"
+    wire.seed_markdown(slug, _md({"type": "research-report"}, "REPORT BODY"))
+    assert wiki_draft(wire.client(), slug) == "REPORT BODY"
 
 
 def test_schema_prefixes_not_analysis_or_wiki():
@@ -350,24 +462,15 @@ def test_schema_prefixes_not_analysis_or_wiki():
 
 
 def test_stub_queue_put_page_that_drops_query_fails():
-    class Dropping:
-        def get_page(self, slug: str) -> dict:
-            return {"query": "keep-me", "run_id": "r", "body": {"query": "keep-me", "run_id": "r"}}
-
-        def put_page(self, slug: str, **kwargs: Any) -> None:
-            body = dict(kwargs)
-            body.pop("query", None)
-            if isinstance(body.get("body"), dict):
-                body["body"].pop("query", None)
-
     from hyperresearch.workflow import merge_queue
 
-    # merge_queue itself refuses if query would be missing after merge; dropping client is the stub.
-    gbrain = FakePageStore()
-    gbrain.pages["q"] = {"query": "keep", "run_id": "r", "body": {"query": "keep", "run_id": "r"}}
-    merged = merge_queue(gbrain, "q", status="published", run_id="r", query="keep")
+    wire = McpWire()
+    wire.seed_markdown("q", _md({"type": "research-queue", "query": "keep", "run_id": "r"}))
+    merged = merge_queue(wire.client(), "q", status="published", run_id="r", query="keep")
     assert merged["query"] == "keep"
     assert merged["run_id"] == "r"
+    content = wire.tool_args("put_page")[-1]["content"]
+    assert "query: keep" in content or "query:keep" in content
 
 
 def test_matching_hash_is_partial_until_index(tmp_vault, monkeypatch):
@@ -376,15 +479,19 @@ def test_matching_hash_is_partial_until_index(tmp_vault, monkeypatch):
     init_run(tmp_vault, tag, company="shoshin")
     report = b"# body\n"
     _package(tmp_vault, tag, report)
-    gbrain = FakePageStore()
     env = freeze_envelope(run_id=tag, report_bytes=report, title="t", package_digest="d")
-    env["raw"] = {hashlib.sha256(b"raw").hexdigest(): hashlib.sha256(b"raw").hexdigest()}
-    gbrain.pages[env["slug"]] = {"body": report.decode()}
+    env["raw"] = []
+    wire = McpWire()
+    wire.seed_markdown(
+        env["slug"],
+        _md({"type": "research-report", "published_sha256": env["published_report_sha256"]}, report.decode()),
+    )
     st = load_workflow(tmp_vault.run_dir(tag))
     st["publication"] = {"status": "idle", "envelope": env}
     save_workflow(tmp_vault.run_dir(tag), st)
-    out = publish_package(gbrain, tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
+    out = publish_package(wire.client(), tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
     assert out["publication"]["status"] == "ok"
+    assert [a for a in wire.tool_args("put_page") if a["slug"] == env["slug"]] == []
 
 
 def test_raw_conflict(tmp_vault, monkeypatch):
@@ -394,16 +501,21 @@ def test_raw_conflict(tmp_vault, monkeypatch):
     report = b"# body\n"
     _package(tmp_vault, tag, report)
     digest = hashlib.sha256(b"one").hexdigest()
-    gbrain = FakePageStore()
-    gbrain.raw[f"research-{digest}"] = b"different"
     env = freeze_envelope(run_id=tag, report_bytes=report, title="t", package_digest="d")
-    env["raw"] = {digest: digest}
+    env["raw"] = [{"sha256": digest, "body": "one"}]
+    wire = McpWire()
+    wire.seed_markdown(
+        env["slug"],
+        _md({"type": "research-report", "published_sha256": env["published_report_sha256"]}, report.decode()),
+    )
+    wire.raw[(env["slug"], f"research-{digest}")] = {"sha256": "different", "body": "different"}
     st = load_workflow(tmp_vault.run_dir(tag))
     st["publication"] = {"status": "idle", "envelope": env}
     save_workflow(tmp_vault.run_dir(tag), st)
-    out = publish_package(gbrain, tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
+    out = publish_package(wire.client(), tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
     assert out["publication"]["reason"] == "raw_conflict"
-    assert gbrain.raw[f"research-{digest}"] == b"different"
+    assert wire.raw[(env["slug"], f"research-{digest}")]["body"] == "different"
+    assert wire.tool_args("put_raw_data") == []
 
 
 def test_engine_has_no_hardcoded_paperclip_uuids():
@@ -415,57 +527,63 @@ def test_engine_has_no_hardcoded_paperclip_uuids():
     assert "PAPERCLIP_" not in text
 
 
-_WIKI = "companies/shoshin/knowledge/wiki/topic"
-
-
-def _queue_items(gbrain: FakePageStore) -> list[dict[str, Any]]:
+def _queue_items(wire: McpWire) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    for slug, page in gbrain.pages.items():
-        if not slug.startswith("companies/shoshin/research/queue/"):
-            continue
-        raw = page.get("body")
-        items.append(raw if isinstance(raw, dict) else page)
+    for slug, page in wire.pages.items():
+        if slug.startswith("companies/shoshin/research/queue/"):
+            items.append(page.get("frontmatter") or {})
     return items
 
 
 def test_harvest_two_open_gaps_lines(tmp_path: Path) -> None:
-    gbrain = FakePageStore()
-    gbrain.pages[_WIKI] = {
-        "slug": _WIKI,
-        "type": "wiki",
-        "body": "## Open-gaps\n- first known hole\n- second known hole\n",
-    }
-    harvest_gaps(company="shoshin", gbrain=gbrain, lock_path=tmp_path / "co.lock")
-    items = _queue_items(gbrain)
+    wire = McpWire()
+    wire.seed_page(_fixture_payload("get_page_wiki.sse"))
+    harvest_gaps(company="shoshin", gbrain=wire.client(), lock_path=tmp_path / "co.lock")
+    items = _queue_items(wire)
     assert len(items) == 2
     assert {i["gap_text"] for i in items} == {"first known hole", "second known hole"}
     assert all(i["origin"] == "wiki-gap" and i["status"] == "pending" for i in items)
+    _assert_live_args(wire)
+    list_calls = wire.tool_args("list_pages")
+    assert any("type" not in a for a in list_calls)
+    assert any(a.get("type") == "research-queue" for a in list_calls)
 
 
 def test_harvest_reharvest_adds_none(tmp_path: Path) -> None:
-    gbrain = FakePageStore()
-    gbrain.pages[_WIKI] = {
-        "slug": _WIKI,
-        "type": "wiki",
-        "body": "## Open-gaps\n- first known hole\n- second known hole\n",
-    }
+    wire = McpWire()
+    wire.seed_page(_fixture_payload("get_page_wiki.sse"))
     lock = tmp_path / "co.lock"
-    harvest_gaps(company="shoshin", gbrain=gbrain, lock_path=lock)
-    puts = len(gbrain.put_calls)
-    harvest_gaps(company="shoshin", gbrain=gbrain, lock_path=lock)
-    assert len(_queue_items(gbrain)) == 2
-    assert len(gbrain.put_calls) == puts
+    harvest_gaps(company="shoshin", gbrain=wire.client(), lock_path=lock)
+    puts = len(wire.tool_args("put_page"))
+    harvest_gaps(company="shoshin", gbrain=wire.client(), lock_path=lock)
+    assert len(_queue_items(wire)) == 2
+    assert len(wire.tool_args("put_page")) == puts
 
 
 def test_harvest_empty_gaps_zero(tmp_path: Path) -> None:
-    gbrain = FakePageStore()
-    gbrain.pages[_WIKI] = {
-        "slug": _WIKI,
-        "type": "wiki",
-        "body": "## Gaps\n\n## Other\n- not harvested\n",
-    }
-    harvest_gaps(company="shoshin", gbrain=gbrain, lock_path=tmp_path / "co.lock")
-    assert _queue_items(gbrain) == []
+    wire = McpWire()
+    wire.seed_markdown(
+        "companies/shoshin/knowledge/wiki/topic",
+        _md({"type": "concept", "title": "t"}, "## Gaps\n\n## Other\n- not harvested\n"),
+    )
+    harvest_gaps(company="shoshin", gbrain=wire.client(), lock_path=tmp_path / "co.lock")
+    assert _queue_items(wire) == []
+
+
+def test_harvest_ignores_pages_outside_prefix(tmp_path: Path) -> None:
+    wire = McpWire()
+    mixed = _fixture_payload("list_pages_mixed.sse")
+    for row in mixed:
+        wire.pages[row["slug"]] = {**row, "frontmatter": {}, "compiled_truth": "", "content": _md({"type": row["type"]})}
+    wire.seed_page(_fixture_payload("get_page_wiki.sse"))
+    harvest_gaps(company="shoshin", gbrain=wire.client(), lock_path=tmp_path / "co.lock")
+    assert all(
+        not s.startswith("companies/stark-industries/")
+        for s in wire.pages
+        if s.startswith("companies/shoshin/research/queue/")
+    )
+    list_calls = wire.tool_args("list_pages")
+    assert all("prefix" not in a for a in list_calls)
 
 
 def test_drain_cli_passes_configured_runtime_and_reader(tmp_path, monkeypatch):
@@ -496,14 +614,12 @@ def test_drain_cli_passes_configured_runtime_and_reader(tmp_path, monkeypatch):
     monkeypatch.setattr(wfcli, "_make_runtime", lambda name: Sentinel() if name != "fake" else FakeRuntime())
     monkeypatch.setattr("hyperresearch.pipeline.orchestrator.execute_run", fake_execute_run)
 
-    gbrain = FakePageStore()
-    gbrain.pages["companies/shoshin/research/queue/q1"] = {
-        "slug": "companies/shoshin/research/queue/q1",
-        "status": "pending",
-        "query": "q",
-        "body": {"status": "pending", "query": "q"},
-    }
-    monkeypatch.setattr(wfcli, "_gbrain", lambda: gbrain)
+    wire = McpWire()
+    wire.seed_markdown(
+        "companies/shoshin/research/queue/q1",
+        _md({"type": "research-queue", "status": "pending", "query": "q"}),
+    )
+    monkeypatch.setattr(wfcli, "_gbrain", wire.client)
     result = CliRunner().invoke(wfcli.app, ["drain", "--company", "shoshin"])
     assert result.exit_code == 0, result.output
     assert captured["knowledge_backend"] == "gbrain"
@@ -546,15 +662,34 @@ def test_successful_new_raw_write_and_retry_skip(tmp_vault, monkeypatch):
             }
         ],
     )
-    gbrain = FakePageStore()
-    first = publish_package(gbrain, tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
+    wire = McpWire()
+    first = publish_package(wire.client(), tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
     assert first["publication"]["status"] == "ok"
-    key = f"research-{hashlib.sha256(evidence).hexdigest()}"
-    assert gbrain.raw[key] == evidence
-    assert gbrain.raw_puts == [(key, evidence)]
-    second = publish_package(gbrain, tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
+    source = f"research-{hashlib.sha256(evidence).hexdigest()}"
+    slug = f"companies/shoshin/research/reports/{tag}"
+    raw_puts = wire.tool_args("put_raw_data")
+    assert raw_puts == [
+        {
+            "slug": slug,
+            "source": source,
+            "data": {
+                "sha256": hashlib.sha256(evidence).hexdigest(),
+                "document_id": "d1",
+                "namespace": "shoshin",
+                "type": "wiki",
+                "provenance": [],
+                "body": evidence.decode(),
+            },
+        }
+    ]
+    report_put = wire.tool_args("put_page")[0]
+    assert set(report_put) == {"slug", "content"}
+    assert "type: research-report" in report_put["content"]
+    assert "published_sha256:" in report_put["content"]
+    _assert_live_args(wire)
+    second = publish_package(wire.client(), tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
     assert second["publication"]["status"] == "ok"
-    assert gbrain.raw_puts == [(key, evidence)]
+    assert wire.tool_args("put_raw_data") == raw_puts
 
 
 def test_get_raw_data_exception_does_not_overwrite(tmp_vault, monkeypatch):
@@ -574,15 +709,11 @@ def test_get_raw_data_exception_does_not_overwrite(tmp_vault, monkeypatch):
             }
         ],
     )
-
-    class Boom(FakePageStore):
-        def get_raw_data(self, key: str) -> bytes | None:
-            raise RuntimeError("transport")
-
-    gbrain = Boom()
-    out = publish_package(gbrain, tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
+    wire = McpWire()
+    wire.raw_error = True
+    out = publish_package(wire.client(), tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
     assert out["publication"]["reason"] == "http"
-    assert gbrain.raw_puts == []
+    assert wire.tool_args("put_raw_data") == []
 
 
 def test_index_merge_keeps_existing_yaml_row(tmp_vault, monkeypatch):
@@ -590,20 +721,15 @@ def test_index_merge_keeps_existing_yaml_row(tmp_vault, monkeypatch):
     tag = "idx-md"
     init_run(tmp_vault, tag, company="shoshin")
     _package(tmp_vault, tag, b"# Title\nhello\n")
-    gbrain = FakePageStore()
-    gbrain.pages["companies/shoshin/research/index"] = {
-        "body": (
-            "---\nreports:\n  - run_id: old-run\n    slug: old\n"
-            "---\n# Research catalog\nPublished reports for Shoshin.\n"
-        )
-    }
-    publish_package(gbrain, tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
-    puts = [c for c in gbrain.put_calls if c[0] == "companies/shoshin/research/index"]
+    wire = McpWire()
+    wire.seed_page(_fixture_payload("get_page_index_include_content.sse"))
+    publish_package(wire.client(), tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
+    puts = [a for a in wire.tool_args("put_page") if a["slug"] == INDEX_SLUG]
     assert puts
-    body = puts[-1][1]["body"]
-    assert isinstance(body, str)
-    assert "old-run" in body
+    body = puts[-1]["content"]
+    assert "r0" in body
     assert tag in body
+    assert "Human prose kept" in body
 
 
 def test_overlapping_ingest_retries_second_fails_immediately(tmp_vault, tmp_path, monkeypatch):
@@ -639,13 +765,7 @@ def test_ingest_retry_vs_drain_serializes(tmp_vault, tmp_path, monkeypatch):
     lock = tmp_path / "co.lock"
     pc = FakePaperclip()
     slug = "companies/shoshin/research/queue/q1"
-    page = {
-        "slug": slug,
-        "status": "running",
-        "run_id": tag,
-        "query": "q",
-        "body": {"status": "running", "run_id": tag, "query": "q"},
-    }
+    page = {"slug": slug, "status": "running", "run_id": tag, "query": "q"}
     with company_lock(lock):
         with pytest.raises(WorkflowError, match="lock held"):
             ingest_retry(pc, tmp_vault.run_dir(tag), "s", lock)
@@ -654,7 +774,7 @@ def test_ingest_retry_vs_drain_serializes(tmp_vault, tmp_path, monkeypatch):
                 company="shoshin",
                 tier="full",
                 vault=tmp_vault,
-                gbrain=FakePageStore(),
+                gbrain=McpWire().client(),
                 paperclip=pc,
                 run_hpr=lambda *a, **k: (_ for _ in ()).throw(AssertionError("no hpr")),
                 lock_path=lock,
@@ -734,18 +854,12 @@ def test_drain_runtime_recovers_missing_package(tmp_vault, tmp_path):
         )
 
     slug = "companies/shoshin/research/queue/q-rec"
-    page = {
-        "slug": slug,
-        "status": "running",
-        "run_id": tag,
-        "query": "q",
-        "body": {"status": "running", "run_id": tag, "query": "q"},
-    }
+    page = {"slug": slug, "status": "running", "run_id": tag, "query": "q"}
     drain(
         company="shoshin",
         tier="full",
         vault=tmp_vault,
-        gbrain=FakePageStore(),
+        gbrain=McpWire().client(),
         paperclip=None,
         run_hpr=run_hpr,
         lock_path=tmp_path / "lock",
@@ -761,17 +875,16 @@ def test_index_complete_markdown_keeps_old_row(tmp_vault, monkeypatch):
     tag = "idx-complete"
     init_run(tmp_vault, tag, company="shoshin")
     _package(tmp_vault, tag, b"# Title\nhello\n")
-    gbrain = FakePageStore()
     original = (
         "---\nreports:\n  - run_id: old\n    slug: old\n"
         "---\n# Research catalog\nPublished reports for Shoshin.\n"
     )
-    gbrain.pages["companies/shoshin/research/index"] = {"body": original}
-    publish_package(gbrain, tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
-    puts = [c for c in gbrain.put_calls if c[0] == "companies/shoshin/research/index"]
+    wire = McpWire()
+    wire.seed_markdown(INDEX_SLUG, original)
+    publish_package(wire.client(), tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
+    puts = [a for a in wire.tool_args("put_page") if a["slug"] == INDEX_SLUG]
     assert puts
-    body = puts[-1][1]["body"]
-    assert isinstance(body, str)
+    body = puts[-1]["content"]
     assert "run_id: old" in body or "old" in body
     assert tag in body
     assert "Research catalog" in body
@@ -782,14 +895,45 @@ def test_unparseable_index_fails_remote_unchanged(tmp_vault, monkeypatch):
     tag = "idx-bad"
     init_run(tmp_vault, tag, company="shoshin")
     _package(tmp_vault, tag, b"# Title\nhello\n")
-    gbrain = FakePageStore()
     original = "---\nreports: [\n---\n# Research catalog\n"
-    index_slug = "companies/shoshin/research/index"
-    gbrain.pages[index_slug] = {"body": original}
-    out = publish_package(
-        gbrain, tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok"
-    )
+    wire = McpWire()
+    wire.pages[INDEX_SLUG] = {
+        "slug": INDEX_SLUG,
+        "type": "research-index",
+        "compiled_truth": "",
+        "frontmatter": {},
+        "content": original,
+    }
+    out = publish_package(wire.client(), tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
     assert out["publication"]["status"] == "failed"
     assert out["publication"]["reason"] == "conflict"
-    assert gbrain.pages[index_slug]["body"] == original
-    assert not any(c[0] == index_slug for c in gbrain.put_calls)
+    assert wire.pages[INDEX_SLUG]["content"] == original
+    assert not any(a["slug"] == INDEX_SLUG for a in wire.tool_args("put_page"))
+
+
+def test_worker_request_shapes(tmp_vault, monkeypatch):
+    monkeypatch.setenv("GBRAIN_SHOSHIN_BEARER", "tok")
+    tag = "shape-1"
+    init_run(tmp_vault, tag, company="shoshin")
+    evidence = b"EVIDENCE-BODY"
+    _package(
+        tmp_vault,
+        tag,
+        b"# Title\nhello\n",
+        snapshots=[{"ref": "d1", "document_id": "d1", "body": evidence.decode()}],
+    )
+    wire = McpWire()
+    publish_package(wire.client(), tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
+    _assert_live_args(wire)
+    put_page = wire.tool_args("put_page")[0]
+    assert set(put_page) == {"slug", "content"}
+    assert "type: research-report" in put_page["content"]
+    assert "title:" in put_page["content"]
+    assert "published_sha256:" in put_page["content"]
+    raw = wire.tool_args("put_raw_data")[0]
+    assert set(raw) == {"slug", "source", "data"}
+    assert isinstance(raw["data"], dict)
+    got = wire.tool_args("get_raw_data")[0]
+    assert set(got) == {"slug", "source"}
+    get_index = next(a for a in wire.tool_args("get_page") if a["slug"] == INDEX_SLUG)
+    assert get_index.get("include_content") is True

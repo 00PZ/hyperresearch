@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import httpx
@@ -598,13 +601,24 @@ def test_light_tier_company_completed_no_package(tmp_vault):
     assert not (tmp_vault.run_dir("lt-co") / "verified-package").exists()
 
 def test_hpr_imports_without_gbrain_paperclip_extras():
-    import sys
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import hyperresearch.pipeline.orchestrator as orch; "
+                "import sys; "
+                "assert 'paperclip' not in sys.modules; "
+                "assert 'hyperresearch.knowledge.gbrain' not in sys.modules; "
+                "assert orch.execute_run is not None"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr or proc.stdout
 
-    import hyperresearch.pipeline.orchestrator as orch
-
-    assert "paperclip" not in sys.modules
-    assert "hyperresearch.knowledge.gbrain" not in sys.modules
-    assert orch.execute_run is execute_run
 
 
 def test_grep_pipeline_cli_has_no_paperclip():
@@ -692,24 +706,99 @@ def test_hpr_run_company_fails_closed_without_vault_env(monkeypatch, tmp_path):
     assert "HYPERRESEARCH_SHOSHIN_VAULT" in result.output
 
 
-def test_gbrain_search_iserror_is_backend_error(tmp_path):
-    from hyperresearch.knowledge.gbrain import GBrainClient, GBrainReader
+def _wire_dir() -> Path:
+    return Path(__file__).resolve().parents[1] / "fixtures" / "gbrain_wire"
+
+
+def serve_gbrain_fixture(name: str, rpc_id: int) -> httpx.Response:
+    path = _wire_dir() / name
+    raw = path.read_text(encoding="utf-8")
+    if name.endswith(".json"):
+        data = json.loads(raw)
+        data["id"] = rpc_id
+        return httpx.Response(200, json=data, headers={"content-type": "application/json"})
+    lines: list[str] = []
+    for line in raw.splitlines():
+        if line.startswith("data:"):
+            msg = json.loads(line[5:].strip())
+            msg["id"] = rpc_id
+            lines.append("data: " + json.dumps(msg, separators=(",", ":")))
+        else:
+            lines.append(line)
+    body = "\n".join(lines) + "\n"
+    return httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
+
+
+def _fixture_client(name: str, captured: list | None = None):
+    from hyperresearch.knowledge.gbrain import GBrainClient
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "result": {
-                    "isError": True,
-                    "content": [{"type": "text", "text": "Access denied"}],
-                },
-            },
-        )
+        payload = json.loads(request.content)
+        if captured is not None:
+            captured.append(payload)
+        return serve_gbrain_fixture(name, payload["id"])
 
-    client = GBrainClient("http://gbrain.test/mcp", "tok", transport=httpx.MockTransport(handler))
+    return GBrainClient("http://gbrain.test/mcp", "tok", transport=httpx.MockTransport(handler))
+
+
+def test_gbrain_search_two_chunks_one_slug():
+    from hyperresearch.knowledge.gbrain import GBrainReader
+
+    captured: list[dict] = []
+    reader = GBrainReader(_fixture_client("search_two_chunks_one_slug.sse", captured))
+    out = reader.search("airnode")
+    assert out["ok"] is True
+    slugs = [h["document_id"] for h in out["hits"]]
+    assert slugs.count("companies/shoshin/knowledge/wiki/concepts/airnode") == 1
+    assert "companies/stark-industries/employees/jarvis/secret" not in slugs
+    assert "companies/shoshin/research/reports/r0" in slugs
+    assert out["hit_count"] == 2
+    air = next(h for h in out["hits"] if h["document_id"].endswith("airnode"))
+    assert air["type"] == "concept"
+    assert air["provenance"] == []
+    assert captured[0]["params"]["arguments"] == {"query": "airnode"}
+    assert "prefix" not in captured[0]["params"]["arguments"]
+
+
+def test_gbrain_search_empty_is_ok_zero():
+    from hyperresearch.knowledge.gbrain import GBrainReader
+
+    reader = GBrainReader(_fixture_client("search_empty.sse"))
+    out = reader.search("q")
+    assert out == {"ok": True, "hits": [], "hit_count": 0}
+
+
+def test_gbrain_get_page_compiled_truth_not_json_dump():
+    from hyperresearch.knowledge.gbrain import GBrainReader
+
+    captured: list[dict] = []
+    slug = "companies/shoshin/knowledge/wiki/concepts/airnode"
+    reader = GBrainReader(_fixture_client("get_page_wiki.sse", captured))
+    got = reader.get(slug)
+    assert got["ok"] is True
+    assert got["body"].startswith("# AirNode")
+    assert "compiled_truth" not in got["body"]
+    assert got["body"] != json.dumps(got)
+    assert got["provenance"] == ["https://example.org/airnode"]
+    assert got["type"] == "concept"
+    assert captured[0]["params"]["arguments"] == {"slug": slug}
+
+
+def test_gbrain_get_page_not_found_is_absence():
+    from hyperresearch.knowledge.gbrain import GBrainReader
+
+    client = _fixture_client("get_page_not_found.sse")
+    assert client.get_page("companies/shoshin/research/reports/nope") is None
     reader = GBrainReader(client)
+    got = reader.get("companies/shoshin/knowledge/wiki/concepts/airnode")
+    assert got["ok"] is False
+    assert got["error"] == "note_not_found"
+
+
+def test_gbrain_search_iserror_is_backend_error():
+    from hyperresearch.knowledge.gbrain import GBrainReader
+
+    reader = GBrainReader(_fixture_client("permission_denied.sse"))
     out = reader.search("q")
     assert out["ok"] is False
     assert out.get("hit_count") == 0
@@ -717,55 +806,96 @@ def test_gbrain_search_iserror_is_backend_error(tmp_path):
 
 
 def test_gbrain_put_page_iserror_raises():
-    from hyperresearch.knowledge.gbrain import GBrainClient, GBrainError
+    from hyperresearch.knowledge.gbrain import GBrainError
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "result": {
-                    "isError": True,
-                    "content": [{"type": "text", "text": "Access denied"}],
-                },
-            },
-        )
-
-    client = GBrainClient("http://gbrain.test/mcp", "tok", transport=httpx.MockTransport(handler))
-    with pytest.raises(GBrainError):
-        client.put_page("companies/shoshin/research/reports/x", body="x")
+    client = _fixture_client("permission_denied.sse")
+    with pytest.raises(GBrainError) as exc:
+        client.put_page("companies/shoshin/research/reports/x", "---\ntype: research-report\n---\nx")
+    assert exc.value.code == "permission_denied"
 
 
 def test_gbrain_put_raw_data_iserror_raises():
-    from hyperresearch.knowledge.gbrain import GBrainClient, GBrainError
+    from hyperresearch.knowledge.gbrain import GBrainError
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "result": {"isError": True, "content": [{"type": "text", "text": "no"}]},
-            },
-        )
-
-    client = GBrainClient("http://gbrain.test/mcp", "tok", transport=httpx.MockTransport(handler))
-    with pytest.raises(GBrainError):
-        client.put_raw_data("research-abc", b"bytes")
+    client = _fixture_client("invalid_params.sse")
+    with pytest.raises(GBrainError) as exc:
+        client.put_raw_data("companies/shoshin/research/reports/x", "research-abc", {"sha256": "abc"})
+    assert exc.value.code == "invalid_params"
 
 
 def test_gbrain_unrecognized_search_payload_is_not_empty_success():
     from hyperresearch.knowledge.gbrain import GBrainClient, GBrainReader
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": "Access denied"}},
-        )
+        rpc_id = json.loads(request.content)["id"]
+        envelope = {
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "result": {"content": [{"type": "text", "text": "Access denied"}]},
+        }
+        body = f"event: message\ndata: {json.dumps(envelope)}\n\n"
+        return httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
 
     client = GBrainClient("http://gbrain.test/mcp", "tok", transport=httpx.MockTransport(handler))
     reader = GBrainReader(client)
     out = reader.search("q")
     assert out["ok"] is False
     assert out.get("hits") == []
+
+
+def test_gbrain_get_raw_data_empty_is_absence():
+    client = _fixture_client("get_raw_data_empty.sse")
+    assert client.get_raw_data("companies/shoshin/research/reports/r1", "research-deadbeef") == []
+
+
+def test_gbrain_plain_json_list_pages():
+    captured: list[dict] = []
+    client = _fixture_client("plain_json_list_pages.json", captured)
+    assert client.list_pages(type="research-queue", limit=100, offset=0) == []
+    args = captured[0]["params"]["arguments"]
+    assert "prefix" not in args
+    assert args["type"] == "research-queue"
+
+
+def test_gbrain_list_pages_prefix_filter_is_client_side():
+    captured: list[dict] = []
+    client = _fixture_client("list_pages_mixed.sse", captured)
+    rows = client.list_pages_by_prefix(
+        "companies/shoshin/research/queue/", type="research-queue"
+    )
+    slugs = [r["slug"] for r in rows]
+    assert slugs == ["companies/shoshin/research/queue/q1"]
+    args = captured[0]["params"]["arguments"]
+    assert "prefix" not in args
+    assert args["type"] == "research-queue"
+    assert args["limit"] == 100
+
+
+def test_gbrain_invalid_params_is_error_code():
+    from hyperresearch.knowledge.gbrain import GBrainError, GBrainReader
+
+    client = _fixture_client("invalid_params.sse")
+    with pytest.raises(GBrainError) as exc:
+        client.get_page("x")
+    assert exc.value.code == "invalid_params"
+    reader = GBrainReader(_fixture_client("invalid_params.sse"))
+    out = reader.search("q")
+    assert out["ok"] is False
+
+
+@pytest.mark.gbrain_live
+def test_live_gbrain_readonly_search_get_list():
+    from hyperresearch.knowledge.gbrain import GBrainReader
+
+    assert os.environ.get("HYPERRESEARCH_LIVE_GBRAIN") == "1"
+    reader = GBrainReader.from_env()
+    search = reader.search("wiki")
+    assert search["ok"] is True
+    if search["hits"]:
+        got = reader.get(search["hits"][0]["ref"])
+        assert got["ok"] is True
+        assert isinstance(got.get("body"), str)
+    missing = reader.client.get_page("companies/shoshin/research/reports/missing-live-probe-0000")
+    assert missing is None
+    pages = reader.client.list_pages_by_prefix("companies/shoshin/", limit=10)
+    assert isinstance(pages, list)

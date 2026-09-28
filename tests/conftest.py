@@ -107,6 +107,16 @@ def pytest_collection_modifyitems(config, items):
     live_enabled = (
         os.environ.get("HYPERRESEARCH_LIVE_SEARXNG") == "1" and bool(os.environ.get("SEARXNG_URL"))
     )
+    gbrain_requested = "gbrain_live" in markexpr and "not gbrain_live" not in markexpr
+    gbrain_enabled = (
+        os.environ.get("HYPERRESEARCH_LIVE_GBRAIN") == "1"
+        and bool(os.environ.get("GBRAIN_MCP_URL"))
+        and bool(os.environ.get("GBRAIN_SHOSHIN_BEARER") or os.environ.get("GBRAIN_SHOSHIN_CONTENT_BEARER"))
+    )
     if live_requested and live_enabled:
-        return
-    items[:] = [item for item in items if item.get_closest_marker("searxng_live") is None]
+        kept = items
+    else:
+        kept = [item for item in items if item.get_closest_marker("searxng_live") is None]
+    if not (gbrain_requested and gbrain_enabled):
+        kept = [item for item in kept if item.get_closest_marker("gbrain_live") is None]
+    items[:] = kept

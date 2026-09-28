@@ -15,6 +15,7 @@ from hyperresearch.core.profiles import Profile, resolve_profile
 from hyperresearch.core.runs import (
     init_run,
     load_manifest,
+    patch_manifest,
     set_status,
     set_step,
     verify_run,
@@ -29,6 +30,7 @@ from hyperresearch.pipeline.host_actions import (
     budget_from_profile,
     evidence_content_hash,
     load_evidence,
+    load_package_evidence,
     run_host_action_loop,
 )
 from hyperresearch.pipeline.patch import PatchOp, PatchSet, apply_patch_set, content_hash
@@ -367,6 +369,8 @@ def _write_independence(vault: Vault, tag: str, summary: dict[str, Any]) -> None
         "scored": summary.get("scored", 0),
         "clusters": list(summary.get("clusters") or []),
         "audited": list(summary.get("audited") or []),
+        "independent_source_count": int(summary.get("independent_source_count") or 0),
+        "lineages": list(summary.get("lineages") or []),
     }
     (vault.run_dir(tag) / INDEPENDENCE_ARTIFACT).write_text(
         json.dumps(data, indent=2) + "\n", encoding="utf-8"
@@ -391,6 +395,9 @@ def _independence_bound(vault: Vault, tag: str) -> bool:
     if not isinstance(data, dict):
         return False
     if data.get("evidence_hash") != _evidence_hash(vault, tag):
+        return False
+    company = load_manifest(vault, tag).get("company")
+    if company and int(data.get("independent_source_count") or 0) < 1:
         return False
     cited = _cited_note_ids(vault, tag)
     if not cited:
@@ -971,6 +978,140 @@ def _block_if_still_running(
         set_status(vault, tag, "blocked", blocked_on=blocked_on, blocked_reason=blocked_reason)
 
 
+def _mint_verification(vault: Vault, tag: str, snapshots: list[dict[str, Any]]) -> dict[str, Any]:
+    from hyperresearch.pipeline.package import FROZEN_VERIFICATION, verification_of
+
+    frozen = vault.run_dir(tag) / FROZEN_VERIFICATION
+    if frozen.is_file():
+        data = json.loads(frozen.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data.get("cite_check_bind"):
+            return data
+    report = report_path(vault, tag)
+    report_bytes = report.read_bytes() if report.is_file() else b""
+    ver = verification_of(report_bytes, snapshots)
+    frozen.write_text(json.dumps(ver, indent=2) + "\n", encoding="utf-8")
+    return ver
+
+
+def _original_verification(vault: Vault, tag: str) -> dict[str, Any]:
+    from hyperresearch.pipeline.package import FROZEN_VERIFICATION, PackageError
+
+    run_dir = vault.run_dir(tag)
+    frozen = run_dir / FROZEN_VERIFICATION
+    if frozen.is_file():
+        try:
+            data = json.loads(frozen.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise PackageError("artifact_error", "frozen verification is not JSON") from exc
+        if isinstance(data, dict) and data.get("cite_check_bind"):
+            return data
+    cite_data: dict[str, Any] = {}
+    indep_data: dict[str, Any] = {}
+    cite_path = run_dir / CITE_FINDINGS
+    indep_path = run_dir / INDEPENDENCE_ARTIFACT
+    if cite_path.is_file():
+        try:
+            raw = json.loads(cite_path.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError as exc:
+            raise PackageError("artifact_error", "cite-check artifact is not JSON") from exc
+        if isinstance(raw, dict):
+            cite_data = raw
+    if indep_path.is_file():
+        try:
+            raw = json.loads(indep_path.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError as exc:
+            raise PackageError("artifact_error", "independence artifact is not JSON") from exc
+        if isinstance(raw, dict):
+            indep_data = raw
+    report_h = str(cite_data.get("report_hash") or "")
+    evidence_h = str(indep_data.get("evidence_hash") or cite_data.get("evidence_hash") or "")
+    if not report_h or not evidence_h:
+        raise PackageError("artifact_error", "original verification bindings missing")
+    return {
+        "verified_hash": report_h,
+        "cite_check_bind": report_h,
+        "independence_bind": evidence_h,
+        "verified_at": str(cite_data.get("verified_at") or indep_data.get("verified_at") or "recovered"),
+    }
+
+
+def _write_verified_package(vault: Vault, tag: str, company: str) -> dict[str, Any] | None:
+    from hyperresearch.pipeline.package import PackageError, package_path, write_package
+
+    report = report_path(vault, tag)
+    if not report.is_file():
+        patch_manifest(vault, tag, package={"status": "invalid", "reason": "artifact_error"})
+        return _block_ship(
+            vault, tag, {"passed": False},
+            blocked_on="independence",
+            name="package",
+            detail="report missing",
+        )
+    snapshots = load_package_evidence(vault, tag)
+    try:
+        write_package(
+            vault.run_dir(tag),
+            package_path(vault.run_dir(tag)),
+            company=company,
+            run_id=tag,
+            report_bytes=report.read_bytes(),
+            snapshots=snapshots,
+            verification=_mint_verification(vault, tag, snapshots),
+        )
+    except PackageError as exc:
+        patch_manifest(vault, tag, package={"status": "invalid", "reason": exc.reason})
+        failed = {"passed": False, "package": {"status": "invalid", "reason": exc.reason}}
+        return failed
+    return None
+
+
+def _resume_package(vault: Vault, tag: str) -> dict[str, Any] | None:
+    """Skip ModelRuntime when verified package exists or rebuild from disk."""
+    from hyperresearch.pipeline.package import (
+        PackageError,
+        package_path,
+        rebuild_package,
+        validate_package,
+    )
+
+    manifest = load_manifest(vault, tag)
+    if not manifest.get("company"):
+        return None
+    pkg: dict[str, Any] = manifest["package"] if isinstance(manifest.get("package"), dict) else {}
+    if pkg.get("status") == "invalid":
+        return {"manifest": manifest, "verify": {"passed": False, "package": pkg}, "tag": tag}
+    dest = package_path(vault.run_dir(tag))
+    if manifest.get("status") == "verified":
+        try:
+            validate_package(dest)
+            return {"manifest": manifest, "verify": {"passed": True}, "tag": tag}
+        except PackageError:
+            try:
+                snapshots = load_package_evidence(vault, tag)
+                rebuild_package(
+                    vault.run_dir(tag),
+                    company=str(manifest.get("company")),
+                    run_id=tag,
+                    report_path=report_path(vault, tag),
+                    snapshots=snapshots,
+                    verification=_original_verification(vault, tag),
+                )
+            except PackageError as exc:
+                manifest = patch_manifest(
+                    vault, tag, package={"status": "invalid", "reason": exc.reason}
+                )
+                return {
+                    "manifest": manifest,
+                    "verify": {"passed": False, "package": manifest.get("package")},
+                    "tag": tag,
+                }
+            return {
+                "manifest": load_manifest(vault, tag),
+                "verify": {"passed": True},
+                "tag": tag,
+            }
+    return None
+
 def _ship(vault: Vault, tag: str, tier: str) -> dict[str, Any]:
     live = load_manifest(vault, tag)
     if live.get("status") == "blocked" and live.get("blocked_on") != "verify":
@@ -987,14 +1128,37 @@ def _ship(vault: Vault, tag: str, tier: str) -> dict[str, Any]:
         set_status(vault, tag, "completed")
         return result
     try:
-        from hyperresearch.core.independence import compute_independence
+        from hyperresearch.core.independence import (
+            cluster_evidence_independence,
+            compute_independence,
+        )
 
-        ids = [str(s.get("note_id") or "") for s in load_evidence(vault, tag)]
+        sources = load_evidence(vault, tag)
+        ids = [str(s.get("note_id") or "") for s in sources]
         ids = [i for i in ids if i]
         summary = compute_independence(vault, note_ids=ids)
+        cluster = cluster_evidence_independence(
+            [
+                {
+                    "id": s.get("note_id"),
+                    "document_id": s.get("document_id") or s.get("note_id"),
+                    "provenance": s.get("provenance") or [],
+                    "url": s.get("url"),
+                }
+                for s in sources
+            ]
+        )
+        summary["independent_source_count"] = cluster["independent_source_count"]
+        summary["lineages"] = cluster["clusters"]
+        summary["audited"] = sorted(set(summary.get("audited") or []) | set(cluster["audited"]))
         path = vault.run_dir(tag) / INDEPENDENCE_ARTIFACT
         if not path.exists():
             _write_independence(vault, tag, summary)
+        else:
+            # Keep bind hash current when we add lineage counts.
+            existing = json.loads(path.read_text(encoding="utf-8-sig"))
+            if "independent_source_count" not in existing:
+                _write_independence(vault, tag, summary)
     except Exception as exc:
         return _block_ship(
             vault, tag, result,
@@ -1019,6 +1183,11 @@ def _ship(vault: Vault, tag: str, tier: str) -> dict[str, Any]:
                 f"evidence={_evidence_hash(vault, tag)[:12]}"
             ),
         )
+    company = load_manifest(vault, tag).get("company")
+    if company:
+        packaged = _write_verified_package(vault, tag, str(company))
+        if packaged is not None:
+            return packaged
     set_status(vault, tag, "verified")
     return result
 
@@ -1032,6 +1201,10 @@ async def execute_run(
     tag: str | None = None,
     resume: bool = False,
     budget_usd: float | None = None,
+    company: str | None = None,
+    knowledge_backend: str | None = None,
+    knowledge_reader: Any | None = None,
+    files_root: Path | None = None,
 ) -> dict[str, Any]:
     if resume:
         if not tag:
@@ -1039,9 +1212,36 @@ async def execute_run(
         run_tag = tag
         manifest = load_manifest(vault, run_tag)
         query = _query_text(vault, run_tag, query)
+        company = company or manifest.get("company")
+        knowledge_backend = knowledge_backend or manifest.get("knowledge_backend")
+        skipped = _resume_package(vault, run_tag)
+        if skipped is not None:
+            return skipped
     else:
         run_tag = tag or mint_run_tag(query)
-        manifest = init_run(vault, run_tag, profile=profile, budget_usd=budget_usd, query=query)
+        manifest = init_run(
+            vault,
+            run_tag,
+            profile=profile,
+            budget_usd=budget_usd,
+            query=query,
+            company=company,
+            knowledge_backend=knowledge_backend,
+        )
+
+    if company and company not in {"shoshin"}:
+        set_status(vault, run_tag, "blocked", blocked_on="config", blocked_reason="unknown company")
+        return {
+            "manifest": load_manifest(vault, run_tag),
+            "verify": {"passed": False, "blocked_on": "config"},
+            "tag": run_tag,
+        }
+
+    backend = knowledge_backend or manifest.get("knowledge_backend") or "none"
+    if knowledge_reader is None and backend and backend != "none":
+        from hyperresearch.pipeline.knowledge import load_reader
+
+        knowledge_reader = load_reader(str(backend), files_root=files_root)
 
     run_dir = vault.run_dir(run_tag)
     qpath = run_dir / "query.md"
@@ -1057,7 +1257,14 @@ async def execute_run(
     resolved = resolve_profile(profile, vault.config_path)
     budget = budget_from_profile(resolved, manifest)
     ledger = SpendLedger(vault=vault, tag=run_tag)
-    executor = HostExecutor(vault=vault, workspace_root=vault.root, run_tag=run_tag)
+    executor = HostExecutor(
+        vault=vault,
+        workspace_root=vault.root,
+        run_tag=run_tag,
+        company=company,
+        knowledge_backend=str(backend),
+        knowledge_reader=knowledge_reader,
+    )
     from hyperresearch.web.searxng import validate_search_config
 
     gate = validate_search_config(vault.config)

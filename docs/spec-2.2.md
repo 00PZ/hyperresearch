@@ -2,7 +2,9 @@
 
 Implementer contract. Do not re-grill Spec 1 (host pipeline, ModelRuntime, no wiki-write in the fork) or Spec 1.5 (SearXNG JSON search, crawl4ai fetch). Spec 2.1 (company workflow inside `hpr`) is superseded. Do not implement until the operator says `go`.
 
-**Revision 2.2.9:** PR #3 review of `ad7d996`: report title comes from the first `# ` H1 of the report body (real Spec 1 final reports have no frontmatter; `final_report_<tag>.md` starts with `# Title`), falling back to frontmatter `title:` then `run_id`. `list_pages_by_prefix` pages with `sort=slug` so a concurrent write cannot shift offsets. Small cleanups: no builtin-shadowing parameter names, `GBrainError.code` empty when the server gave no code, no duplicated branches, fixture files without trailing blank lines.
+**Revision 2.2.10:** critical review of `45822be` (repeated-drain probes): drain is a **per-item dispatch table**. `published` items are skipped (no GBrain write, no Paperclip). Research `blocked` (Spec 1 terminal `blocked_on`) → queue `failed` with `blocked_on`, no `hpr` call. A per-item exception (invalid `run_id`, malformed queue page, unexpected error) marks only that item `failed` with `reason` and the drain continues. The index is written only when the merged `reports:` differs from the remote (idempotent publish). Reader `search` passes `scope` to GBrain as `types` when it is a known page type, else ignores it (documented). Frontmatter-title fallback gets a test.
+
+**Revision 2.2.9 (prior):** PR #3 review of `ad7d996`: report title comes from the first `# ` H1 of the report body (real Spec 1 final reports have no frontmatter; `final_report_<tag>.md` starts with `# Title`), falling back to frontmatter `title:` then `run_id`. `list_pages_by_prefix` pages with `sort=slug` so a concurrent write cannot shift offsets. Small cleanups: no builtin-shadowing parameter names, `GBrainError.code` empty when the server gave no code, no duplicated branches, fixture files without trailing blank lines.
 
 **Revision 2.2.8 (prior):** PR #3 live-wire review: the GBrain client was built against an invented MCP shape and failed every call against the live server. New section **GBrain MCP wire contract (live)** is binding for every GBrain call (reader and worker): SSE transport, JSON-in-`content[0].text` payloads, `compiled_truth` body, `page_not_found` = confirmed absence, live tool arguments (`put_page {slug, content}`, `get/put_raw_data {slug, source, data}`), no `list_pages` prefix filter. Raw evidence keys move from a free-standing `research-<sha>` key to `source=research-<sha>` attached to the report slug. Report skip/conflict reads `published_sha256` from the report frontmatter. Test fixtures must be the live wire shape; the import-isolation test runs in a subprocess.
 
@@ -279,6 +281,17 @@ Resume:
 - Named enqueue: CEO/operator HTTP MCP `put_page`. Worker helper may exist; CEO pod does not run `hpr`.
 - Harvest: living `type=wiki`; `Open-gaps` / `Gaps`; `dedup_hash(wiki_slug + gap_text)`; skip empty dashes and hub primer SKUs. Harvest takes the company lock.
 - Claim under lock: `pending` → `running` + new `run_id` then `hpr`/`execute_run` with the **configured** runtime and KnowledgeReader. `running` / `published_pending_ingest` with `run_id` → resume dispatch (above). Fail immediately if lock held.
+- Drain dispatch table (per queue item, under the company lock; one item never stops the loop):
+  - `published` → skip. No `get_page`/`put_page` of report, raw, index or queue; no Paperclip call.
+  - `failed` → skip.
+  - `published_pending_ingest` → ingest dispatch only (reconcile / first POST per ingest status); never re-publish.
+  - `pending` → claim (`running` + new `run_id`), then as `running`.
+  - `running` + research `blocked` (any Spec 1 terminal `blocked_on`) → queue `failed`, `blocked_on` copied, no `hpr` call.
+  - `running` + `package.status=invalid` → skip (unchanged).
+  - `running` + not verified → `hpr` resume once for that `run_id`.
+  - `running` + verified + complete package → publish, then ingest.
+  - Any exception while handling one item (e.g. `InvalidRunTagError`, unparseable queue frontmatter) → that item `failed`, `reason=item_error`, `detail`; drain continues. If even the `failed` write fails, record it in the drain result and continue.
+- Publish idempotency: the index `put_page` runs only if the merged `reports:` list differs from the remote list (compare canonical JSON). The queue page is written only when a field actually changes.
 - Drain `--tier full` only. Light `completed` does not publish and does not POST Librarian.
 - `save_workflow` writes a sibling temp file then `os.replace` onto `workflow.json`. An interrupted save must retain the previous valid checkpoint (must not leave `{` / truncated JSON).
 
@@ -366,6 +379,12 @@ Split suites so core cannot pass by importing GBrain or Paperclip.
 
 **Workflow worker (mocked HTTP, may live under `tests/integrations/`):**
 
+- Repeated drain: after a full publish (queue `published`, one POST), a second drain issues **zero** `put_page` and zero Paperclip calls.
+- Blocked run: queue `running` with manifest `status=blocked`, `blocked_on=budget` → drain makes no `run_hpr` call and sets queue `failed` with `blocked_on: budget`; a second drain makes no call.
+- Poison item: queue item `run_id: ../x` sorted before a valid `pending` item → drain exits normally, bad item `failed` / `item_error`, valid item claimed and `run_hpr` called.
+- `publish_package` twice with the same envelope and an index that already has the row → the second call does not `put_page` the index.
+- Frontmatter-title fallback: report `---\ntitle: FM\n---\nbody` (no H1) publishes `title: FM`.
+- Reader `search(query, scope="concept")` sends `types: ["concept"]`; an unknown scope sends no `types`.
 - Two overlapping workers: one holds the lock; the other exits immediately; does not start `hpr run`. GBrain mock `put_page` is unconditional.
 - CLI drain (not an injected `run_hpr` double) passes the configured AgentRuntime and KnowledgeReader into `execute_run`. With GBrain credentials configured, `knowledge_backend` is not silently `none`. `FakeRuntime` only when `--runtime fake` / test.
 - Missing `HYPERRESEARCH_SHOSHIN_VAULT` → `hr-workflow drain` fails closed; does not select the ambient vault.

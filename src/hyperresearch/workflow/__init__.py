@@ -360,15 +360,17 @@ def publish_package(
                 return _fail_pub(state, pub, run_dir, status="failed", reason="conflict")
             else:
                 reports = [r for r in reports_raw if isinstance(r, dict)]
+        remote_reports = reports
         row = dict(envelope["index_row"])
         row["published_at"] = envelope["published_at"]
         row["verified_hash"] = verification.get("verified_hash")
-        reports = [r for r in reports if r.get("run_id") != run_id]
-        reports.append(row)
-        payload = dict(meta)
-        payload["type"] = payload.get("type") or "research-index"
-        payload["reports"] = reports
-        gbrain.put_page(INDEX_SLUG, _markdown(payload, md_body))
+        merged_reports = [r for r in remote_reports if r.get("run_id") != run_id]
+        merged_reports.append(row)
+        if json.dumps(merged_reports, sort_keys=True) != json.dumps(remote_reports, sort_keys=True):
+            payload = dict(meta)
+            payload["type"] = payload.get("type") or "research-index"
+            payload["reports"] = merged_reports
+            gbrain.put_page(INDEX_SLUG, _markdown(payload, md_body))
     except Exception as exc:
         return _fail_pub(state, pub, run_dir, status="failed", reason="http", detail=str(exc))
     pub["status"] = "ok"
@@ -493,7 +495,9 @@ def merge_queue(gbrain: Any, slug: str, **fields: Any) -> dict[str, Any]:
     else:
         fm, rest = {}, ""
     merged = {**fm, **fields, "type": "research-queue"}
-    if "query" not in merged or "run_id" not in merged:
+    if merged == fm:
+        return merged
+    if fields.get("reason") != "item_error" and ("query" not in merged or "run_id" not in merged):
         raise WorkflowError("queue put_page dropped query/run_id")
     gbrain.put_page(slug, _markdown(merged, rest))
     return merged
@@ -652,72 +656,22 @@ def _drain_locked(
     queue_pages: list[dict[str, Any]],
     runtime: Any | None,
 ) -> dict[str, Any]:
-    results = []
-    for page in queue_pages:
-        item: dict[str, Any] = page
-        slug = str(page.get("slug") or item.get("slug") or "")
-        status = str(item.get("status") or "pending")
-        run_id = item.get("run_id")
-        if status == "pending":
-            run_id = run_id or uuid.uuid4().hex[:12]
-            merge_queue(gbrain, slug, status="running", run_id=run_id, query=item.get("query"))
-            status = "running"
-        if not run_id:
-            continue
-        run_dir = vault.run_dir(str(run_id))
-        manifest = None
+    from hyperresearch.core.runs import load_manifest
+
+    results: list[dict[str, Any]] = []
+
+    def manifest_of(run_id: str) -> dict[str, Any] | None:
         try:
-            from hyperresearch.core.runs import load_manifest
-
-            manifest = load_manifest(vault, str(run_id))
+            return load_manifest(vault, run_id)
         except Exception:
-            manifest = None
-        pkg = (manifest or {}).get("package") if isinstance(manifest, dict) else None
-        if isinstance(pkg, dict) and pkg.get("status") == "invalid":
-            results.append({"run_id": run_id, "action": "skip-invalid"})
-            continue
-        research_status = (manifest or {}).get("status")
-        complete = False
-        if research_status == "verified":
-            try:
-                validate_package(package_path(run_dir))
-                complete = True
-            except PackageError:
-                complete = False
-        if research_status == "completed" and tier != "full":
-            results.append({"run_id": run_id, "action": "light-skip"})
-            continue
-        if not complete:
-            resume = research_status == "verified" or (
-                status == "running" and manifest is not None
-            )
-            run_hpr(str(item.get("query") or ""), str(run_id), resume=resume)
-            try:
-                from hyperresearch.core.runs import load_manifest
+            return None
 
-                manifest = load_manifest(vault, str(run_id))
-            except Exception:
-                manifest = None
-            research_status = (manifest or {}).get("status")
-            if research_status == "completed" and tier != "full":
-                results.append({"run_id": run_id, "action": "light-skip"})
-                continue
-            try:
-                validate_package(package_path(run_dir))
-                complete = research_status == "verified"
-            except PackageError:
-                complete = False
-        if not complete:
-            results.append({"run_id": run_id, "action": "research"})
-            continue
-        bearer = os.environ.get("GBRAIN_SHOSHIN_BEARER") or os.environ.get("GBRAIN_SHOSHIN_CONTENT_BEARER")
-        state = publish_package(gbrain, run_dir, company=company, run_id=str(run_id), bearer=bearer)
-        if (state.get("publication") or {}).get("status") == "ok" and paperclip is not None:
-            dispatch_ingest(
-                paperclip,
-                run_dir,
-                research_slug=f"{REPORT_PREFIX}{run_id}",
-            )
+    def ingest_only(slug: str, run_id: Any, query: Any) -> dict[str, Any]:
+        if not run_id:
+            raise WorkflowError("missing run_id")
+        run_dir = vault.run_dir(str(run_id))
+        if paperclip is not None:
+            dispatch_ingest(paperclip, run_dir, research_slug=f"{REPORT_PREFIX}{run_id}")
             wf = load_workflow(run_dir)
             if (wf.get("ingest") or {}).get("status") == "posted":
                 merge_queue(
@@ -725,7 +679,26 @@ def _drain_locked(
                     slug,
                     status="published",
                     run_id=run_id,
-                    query=item.get("query"),
+                    query=query,
+                    ingest_id=(wf.get("ingest") or {}).get("id"),
+                )
+        return {"run_id": run_id, "action": "ingest", "workflow": load_workflow(run_dir)}
+
+    def publish_then_ingest(slug: str, run_id: str, query: Any, run_dir: Path) -> dict[str, Any]:
+        bearer = os.environ.get("GBRAIN_SHOSHIN_BEARER") or os.environ.get(
+            "GBRAIN_SHOSHIN_CONTENT_BEARER"
+        )
+        state = publish_package(gbrain, run_dir, company=company, run_id=run_id, bearer=bearer)
+        if (state.get("publication") or {}).get("status") == "ok" and paperclip is not None:
+            dispatch_ingest(paperclip, run_dir, research_slug=f"{REPORT_PREFIX}{run_id}")
+            wf = load_workflow(run_dir)
+            if (wf.get("ingest") or {}).get("status") == "posted":
+                merge_queue(
+                    gbrain,
+                    slug,
+                    status="published",
+                    run_id=run_id,
+                    query=query,
                     ingest_id=(wf.get("ingest") or {}).get("id"),
                 )
             else:
@@ -734,9 +707,94 @@ def _drain_locked(
                     slug,
                     status="published_pending_ingest",
                     run_id=run_id,
-                    query=item.get("query"),
+                    query=query,
                 )
-        results.append({"run_id": run_id, "action": "publish", "workflow": load_workflow(run_dir)})
+        return {"run_id": run_id, "action": "publish", "workflow": load_workflow(run_dir)}
+
+    def dispatch(item: dict[str, Any]) -> dict[str, Any]:
+        slug = str(item.get("slug") or "")
+        status = str(item.get("status") or "pending")
+        run_id = item.get("run_id")
+        query = item.get("query")
+        if status in {"published", "failed"}:
+            return {"slug": slug, "run_id": run_id, "action": "skip"}
+        if status == "published_pending_ingest":
+            return ingest_only(slug, run_id, query)
+        if status == "pending":
+            run_id = run_id or uuid.uuid4().hex[:12]
+            merge_queue(gbrain, slug, status="running", run_id=run_id, query=query)
+            status = "running"
+        if status != "running":
+            return {"slug": slug, "run_id": run_id, "action": "skip"}
+        if not run_id:
+            raise WorkflowError("missing run_id")
+        run_dir = vault.run_dir(str(run_id))
+        manifest = manifest_of(str(run_id))
+        research_status = (manifest or {}).get("status")
+        if research_status == "blocked":
+            merge_queue(
+                gbrain,
+                slug,
+                status="failed",
+                blocked_on=(manifest or {}).get("blocked_on"),
+                run_id=run_id,
+                query=query,
+            )
+            return {"run_id": run_id, "action": "blocked"}
+        pkg = (manifest or {}).get("package") if isinstance(manifest, dict) else None
+        if isinstance(pkg, dict) and pkg.get("status") == "invalid":
+            return {"run_id": run_id, "action": "skip-invalid"}
+        complete = False
+        if research_status == "verified":
+            try:
+                validate_package(package_path(run_dir))
+                complete = True
+            except PackageError:
+                complete = False
+        if research_status == "completed" and tier != "full":
+            return {"run_id": run_id, "action": "light-skip"}
+        if not complete:
+            resume = research_status == "verified" or (
+                status == "running" and manifest is not None
+            )
+            run_hpr(str(query or ""), str(run_id), resume=resume)
+            manifest = manifest_of(str(run_id))
+            research_status = (manifest or {}).get("status")
+            if research_status == "completed" and tier != "full":
+                return {"run_id": run_id, "action": "light-skip"}
+            try:
+                validate_package(package_path(run_dir))
+                complete = research_status == "verified"
+            except PackageError:
+                complete = False
+        if not complete:
+            return {"run_id": run_id, "action": "research"}
+        return publish_then_ingest(slug, str(run_id), query, run_dir)
+
+    for page in queue_pages:
+        item: dict[str, Any] = dict(page) if isinstance(page, dict) else {}
+        slug = str(item.get("slug") or "")
+        try:
+            results.append(dispatch(item))
+        except Exception as exc:
+            try:
+                merge_queue(
+                    gbrain,
+                    slug,
+                    status="failed",
+                    reason="item_error",
+                    detail=str(exc),
+                )
+                results.append({"slug": slug, "action": "item_error", "detail": str(exc)})
+            except Exception as write_exc:
+                results.append(
+                    {
+                        "slug": slug,
+                        "action": "item_error",
+                        "detail": str(exc),
+                        "write_error": str(write_exc),
+                    }
+                )
     return {"ok": True, "results": results}
 
 

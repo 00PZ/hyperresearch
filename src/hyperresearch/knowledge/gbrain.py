@@ -254,9 +254,16 @@ class GBrainReader:
         return cls(GBrainClient(url, bearer, transport=transport))
 
     def search(self, query: str, scope: str | None = None) -> dict[str, Any]:
-        del scope
+        """Search company knowledge.
+
+        If ``scope`` is a non-empty string, pass ``types=[scope]`` to
+        ``client.search``. Otherwise omit ``types``.
+        """
+        kwargs: dict[str, Any] = {}
+        if isinstance(scope, str) and scope:
+            kwargs["types"] = [scope]
         try:
-            result = self.client.search(query)
+            result = self.client.search(query, **kwargs)
         except (GBrainError, httpx.HTTPError, ValueError, TypeError) as exc:
             return error_result(str(exc))
         if not isinstance(result, list):

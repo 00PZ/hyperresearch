@@ -975,3 +975,139 @@ def test_publish_title_fallback_run_id(tmp_vault, monkeypatch):
     index_put = next(a for a in wire.tool_args("put_page") if a["slug"] == INDEX_SLUG)
     row = next(r for r in _put_frontmatter(index_put["content"])["reports"] if r["run_id"] == tag)
     assert row["title"] == tag
+
+
+def test_repeated_drain_zero_writes(tmp_vault, tmp_path, monkeypatch):
+    monkeypatch.setenv("GBRAIN_SHOSHIN_BEARER", "tok")
+    monkeypatch.setenv("PAPERCLIP_API_URL", "http://paperclip.test")
+    monkeypatch.setenv("PAPERCLIP_COMPANY_ID", "co")
+    monkeypatch.setenv("PAPERCLIP_LIBRARIAN_AGENT_ID", "lib")
+    tag = "rep-drain"
+    init_run(tmp_vault, tag, company="shoshin")
+    set_status(tmp_vault, tag, "verified")
+    _package(tmp_vault, tag)
+    wire = McpWire()
+    slug = "companies/shoshin/research/queue/rep"
+    wire.seed_markdown(
+        slug,
+        _md({"type": "research-queue", "status": "running", "run_id": tag, "query": "q"}),
+    )
+    pc = FakePaperclip()
+    calls: list[str] = []
+
+    def run_hpr(*args, **kwargs):
+        calls.append("hpr")
+
+    kwargs = {
+        "company": "shoshin",
+        "tier": "full",
+        "vault": tmp_vault,
+        "gbrain": wire.client(),
+        "paperclip": pc,
+        "run_hpr": run_hpr,
+        "lock_path": tmp_path / "lock",
+    }
+    drain(**kwargs)
+    assert calls == []
+    assert len(pc.posts) == 1
+    puts = list(wire.tool_args("put_page"))
+    assert puts
+    drain(**kwargs)
+    assert calls == []
+    assert wire.tool_args("put_page") == puts
+    assert len(pc.posts) == 1
+
+
+def test_drain_blocked_run_no_hpr(tmp_vault, tmp_path):
+    tag = "blk-1"
+    init_run(tmp_vault, tag, company="shoshin")
+    patch_manifest(tmp_vault, tag, status="blocked", blocked_on="budget")
+    wire = McpWire()
+    slug = "companies/shoshin/research/queue/blk"
+    wire.seed_markdown(
+        slug,
+        _md({"type": "research-queue", "status": "running", "run_id": tag, "query": "q"}),
+    )
+    calls: list[str] = []
+
+    def run_hpr(*args, **kwargs):
+        calls.append("hpr")
+
+    kwargs = {
+        "company": "shoshin",
+        "tier": "full",
+        "vault": tmp_vault,
+        "gbrain": wire.client(),
+        "paperclip": FakePaperclip(),
+        "run_hpr": run_hpr,
+        "lock_path": tmp_path / "lock",
+    }
+    drain(**kwargs)
+    assert calls == []
+    fm = wire.pages[slug]["frontmatter"]
+    assert fm["status"] == "failed"
+    assert fm["blocked_on"] == "budget"
+    drain(**kwargs)
+    assert calls == []
+
+
+def test_drain_poison_item_continues(tmp_vault, tmp_path):
+    calls: list[tuple] = []
+
+    def run_hpr(query: str, run_id: str, resume: bool = False) -> None:
+        calls.append((query, run_id, resume))
+
+    poison_slug = "companies/shoshin/research/queue/aaa-poison"
+    ok_slug = "companies/shoshin/research/queue/zzz-ok"
+    wire = McpWire()
+    out = drain(
+        company="shoshin",
+        tier="full",
+        vault=tmp_vault,
+        gbrain=wire.client(),
+        paperclip=FakePaperclip(),
+        run_hpr=run_hpr,
+        lock_path=tmp_path / "lock",
+        queue_pages=[
+            {"slug": poison_slug, "status": "running", "run_id": "../x", "query": "bad"},
+            {"slug": ok_slug, "status": "pending", "query": "good"},
+        ],
+    )
+    assert out["ok"] is True
+    poison_fm = wire.pages[poison_slug]["frontmatter"]
+    assert poison_fm["status"] == "failed"
+    assert poison_fm["reason"] == "item_error"
+    assert poison_fm.get("detail")
+    assert calls
+    assert calls[0][0] == "good"
+    ok_fm = wire.pages[ok_slug]["frontmatter"]
+    assert ok_fm["status"] == "running"
+    assert ok_fm["run_id"] == calls[0][1]
+
+
+def test_publish_twice_no_index_put(tmp_vault, monkeypatch):
+    monkeypatch.setenv("GBRAIN_SHOSHIN_BEARER", "tok")
+    tag = "pub-2x"
+    init_run(tmp_vault, tag, company="shoshin")
+    _package(tmp_vault, tag)
+    wire = McpWire()
+    publish_package(wire.client(), tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
+    index_puts = [a for a in wire.tool_args("put_page") if a["slug"] == INDEX_SLUG]
+    assert index_puts
+    publish_package(wire.client(), tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
+    assert [a for a in wire.tool_args("put_page") if a["slug"] == INDEX_SLUG] == index_puts
+
+
+def test_publish_title_fallback_frontmatter(tmp_vault, monkeypatch):
+    monkeypatch.setenv("GBRAIN_SHOSHIN_BEARER", "tok")
+    tag = "title-fm"
+    init_run(tmp_vault, tag, company="shoshin")
+    _package(tmp_vault, tag, b"---\ntitle: FM\n---\nbody")
+    wire = McpWire()
+    publish_package(wire.client(), tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
+    report_slug = f"companies/shoshin/research/reports/{tag}"
+    report_put = next(a for a in wire.tool_args("put_page") if a["slug"] == report_slug)
+    assert _put_frontmatter(report_put["content"])["title"] == "FM"
+    index_put = next(a for a in wire.tool_args("put_page") if a["slug"] == INDEX_SLUG)
+    row = next(r for r in _put_frontmatter(index_put["content"])["reports"] if r["run_id"] == tag)
+    assert row["title"] == "FM"

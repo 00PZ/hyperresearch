@@ -760,6 +760,22 @@ def test_gbrain_search_two_chunks_one_slug():
     assert "prefix" not in captured[0]["params"]["arguments"]
 
 
+def test_gbrain_search_scope_types():
+    from hyperresearch.knowledge.gbrain import GBrainReader
+
+    captured: list[dict] = []
+    reader = GBrainReader(_fixture_client("search_empty.sse", captured))
+    out = reader.search("q", scope="concept")
+    assert out["ok"] is True
+    assert captured[0]["params"]["arguments"] == {"query": "q", "types": ["concept"]}
+    captured.clear()
+    reader.search("q", scope="")
+    assert captured[0]["params"]["arguments"] == {"query": "q"}
+    captured.clear()
+    reader.search("q")
+    assert "types" not in captured[0]["params"]["arguments"]
+
+
 def test_gbrain_search_empty_is_ok_zero():
     from hyperresearch.knowledge.gbrain import GBrainReader
 

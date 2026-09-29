@@ -725,7 +725,7 @@ def serve_gbrain_fixture(name: str, rpc_id: int) -> httpx.Response:
             lines.append("data: " + json.dumps(msg, separators=(",", ":")))
         else:
             lines.append(line)
-    body = "\n".join(lines) + "\n"
+    body = "\n".join(lines).rstrip("\n") + "\n\n"
     return httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
 
 
@@ -861,14 +861,14 @@ def test_gbrain_list_pages_prefix_filter_is_client_side():
     captured: list[dict] = []
     client = _fixture_client("list_pages_mixed.sse", captured)
     rows = client.list_pages_by_prefix(
-        "companies/shoshin/research/queue/", type="research-queue"
+        "companies/shoshin/research/queue/", page_type="research-queue"
     )
     slugs = [r["slug"] for r in rows]
     assert slugs == ["companies/shoshin/research/queue/q1"]
     args = captured[0]["params"]["arguments"]
     assert "prefix" not in args
     assert args["type"] == "research-queue"
-    assert args["limit"] == 100
+    assert args["sort"] == "slug"
 
 
 def test_gbrain_invalid_params_is_error_code():

@@ -85,6 +85,28 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     return data, text[match.end() :]
 
 
+def _report_title(text: str, run_id: str) -> str:
+    body = text
+    fm_title = ""
+    match = FRONTMATTER_RE.match(text)
+    if match:
+        body = text[match.end() :]
+        try:
+            data = yaml.safe_load(match.group(1))
+        except yaml.YAMLError:
+            data = None
+        if isinstance(data, dict):
+            raw = data.get("title")
+            if isinstance(raw, str) and raw.strip():
+                fm_title = raw.strip()
+    for line in body.splitlines():
+        if line.startswith("# "):
+            heading = line[2:].strip()
+            if heading:
+                return heading
+    return fm_title or run_id
+
+
 def _frontmatter_and_rest(page: dict[str, Any]) -> tuple[dict[str, Any], str]:
     content = page.get("content")
     if not isinstance(content, str):
@@ -229,12 +251,8 @@ def publish_package(
     envelope = pub.get("envelope")
     if not isinstance(envelope, dict):
         report = (dest / str((manifest.get("report") or {}).get("path") or "report.md")).read_bytes()
-        title = run_id
         text = report.decode("utf-8", errors="replace")
-        for line in text.splitlines():
-            if line.lower().startswith("title:"):
-                title = line.split(":", 1)[1].strip().strip('"')
-                break
+        title = _report_title(text, run_id)
         envelope = freeze_envelope(
             run_id=run_id,
             report_bytes=report,
@@ -291,8 +309,6 @@ def publish_package(
                 existing = gbrain.get_raw_data(slug, source)
             except Exception as exc:
                 return _fail_pub(state, pub, run_dir, status="failed", reason="http", detail=str(exc))
-            if existing is None:
-                return _fail_pub(state, pub, run_dir, status="failed", reason="http", detail="raw:non_list")
             if not isinstance(existing, list):
                 return _fail_pub(state, pub, run_dir, status="failed", reason="http", detail="raw:non_list")
             if existing:
@@ -492,7 +508,7 @@ def wiki_draft(gbrain: Any, research_slug: str) -> str:
 
 def load_queue_pages(gbrain: Any) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    for row in gbrain.list_pages_by_prefix(QUEUE_PREFIX, type="research-queue"):
+    for row in gbrain.list_pages_by_prefix(QUEUE_PREFIX, page_type="research-queue"):
         slug = str(row.get("slug") or "")
         if not slug:
             continue
@@ -554,7 +570,7 @@ def harvest_gaps(*, company: str, gbrain: Any, lock_path: Path) -> dict[str, Any
 
 def _harvest_locked(gbrain: Any) -> dict[str, Any]:
     existing: set[str] = set()
-    for row in gbrain.list_pages_by_prefix(QUEUE_PREFIX, type="research-queue"):
+    for row in gbrain.list_pages_by_prefix(QUEUE_PREFIX, page_type="research-queue"):
         slug = str(row.get("slug") or "")
         page = gbrain.get_page(slug, include_content=True) if slug else None
         if not isinstance(page, dict):

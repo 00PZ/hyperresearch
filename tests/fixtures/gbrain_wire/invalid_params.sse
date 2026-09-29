@@ -1,3 +1,2 @@
 event: message
 data: {"result":{"content":[{"type":"text","text":"{\n  \"error\": \"invalid_params\",\n  \"message\": \"Missing required parameter: slug\"\n}"}],"isError":true},"jsonrpc":"2.0","id":1}
-

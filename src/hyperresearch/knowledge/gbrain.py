@@ -25,7 +25,7 @@ _LIST_ARGS = frozenset({"type", "tag", "limit", "offset", "sort", "updated_after
 class GBrainError(Exception):
     def __init__(self, message: str, code: str = "") -> None:
         super().__init__(message or code)
-        self.code = code or message
+        self.code = code
 
 
 class GBrainClient:
@@ -109,7 +109,7 @@ class GBrainClient:
         self,
         prefix: str,
         *,
-        type: str | None = None,
+        page_type: str | None = None,
         limit: int = 100,
         **kwargs: Any,
     ) -> list[dict[str, Any]]:
@@ -117,9 +117,9 @@ class GBrainClient:
         offset = 0
         matched: list[dict[str, Any]] = []
         while True:
-            args: dict[str, Any] = {"limit": page_size, "offset": offset, **kwargs}
-            if type is not None:
-                args["type"] = type
+            args: dict[str, Any] = {"limit": page_size, "offset": offset, **kwargs, "sort": "slug"}
+            if page_type is not None:
+                args["type"] = page_type
             rows = self.list_pages(**args)
             if not isinstance(rows, list):
                 raise GBrainError("unrecognized list_pages payload")

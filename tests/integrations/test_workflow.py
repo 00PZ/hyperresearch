@@ -937,3 +937,41 @@ def test_worker_request_shapes(tmp_vault, monkeypatch):
     assert set(got) == {"slug", "source"}
     get_index = next(a for a in wire.tool_args("get_page") if a["slug"] == INDEX_SLUG)
     assert get_index.get("include_content") is True
+
+
+def _put_frontmatter(content: str) -> dict[str, Any]:
+    match = FRONTMATTER_RE.match(content)
+    assert match is not None
+    data = yaml.safe_load(match.group(1))
+    assert isinstance(data, dict)
+    return data
+
+
+def test_publish_title_from_h1(tmp_vault, monkeypatch):
+    monkeypatch.setenv("GBRAIN_SHOSHIN_BEARER", "tok")
+    tag = "title-h1"
+    init_run(tmp_vault, tag, company="shoshin")
+    _package(tmp_vault, tag, b"# EarthNodes in World Mobile\n\nBody.")
+    wire = McpWire()
+    publish_package(wire.client(), tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
+    report_slug = f"companies/shoshin/research/reports/{tag}"
+    report_put = next(a for a in wire.tool_args("put_page") if a["slug"] == report_slug)
+    assert _put_frontmatter(report_put["content"])["title"] == "EarthNodes in World Mobile"
+    index_put = next(a for a in wire.tool_args("put_page") if a["slug"] == INDEX_SLUG)
+    row = next(r for r in _put_frontmatter(index_put["content"])["reports"] if r["run_id"] == tag)
+    assert row["title"] == "EarthNodes in World Mobile"
+
+
+def test_publish_title_fallback_run_id(tmp_vault, monkeypatch):
+    monkeypatch.setenv("GBRAIN_SHOSHIN_BEARER", "tok")
+    tag = "title-run"
+    init_run(tmp_vault, tag, company="shoshin")
+    _package(tmp_vault, tag, b"Body with no heading.\n")
+    wire = McpWire()
+    publish_package(wire.client(), tmp_vault.run_dir(tag), company="shoshin", run_id=tag, bearer="tok")
+    report_slug = f"companies/shoshin/research/reports/{tag}"
+    report_put = next(a for a in wire.tool_args("put_page") if a["slug"] == report_slug)
+    assert _put_frontmatter(report_put["content"])["title"] == tag
+    index_put = next(a for a in wire.tool_args("put_page") if a["slug"] == INDEX_SLUG)
+    row = next(r for r in _put_frontmatter(index_put["content"])["reports"] if r["run_id"] == tag)
+    assert row["title"] == tag

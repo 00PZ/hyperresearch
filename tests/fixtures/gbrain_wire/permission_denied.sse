@@ -1,3 +1,2 @@
 event: message
 data: {"result":{"content":[{"type":"text","text":"{\n  \"error\": \"permission_denied\",\n  \"message\": \"Requested source is outside your granted sources\"\n}"}],"isError":true},"jsonrpc":"2.0","id":1}
-

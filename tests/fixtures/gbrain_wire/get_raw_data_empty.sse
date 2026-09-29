@@ -1,3 +1,2 @@
 event: message
 data: {"result":{"content":[{"type":"text","text":"[]"}]},"jsonrpc":"2.0","id":1}
-
